@@ -46,6 +46,18 @@ class DistanceNN(nn.Module):
             nn.Linear(hidden_size // 4, 1)
         )
         
+    def __get_lstm_input_size(self, img_size):
+        # Calculate the size of the feature map after CNN layers
+        dummy_input = torch.zeros(1, 3, img_size, img_size)
+        with torch.no_grad():
+            feature_map = self.cnn(dummy_input)
+        feature_map_size = feature_map.size(1)
+        
+        # Add size for crop coordinates
+        lstm_input_size = feature_map_size + 4
+        
+        return lstm_input_size
+        
     def __get_init_hidden(self, batch_size, device, transpose=False):
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
         c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
