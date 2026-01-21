@@ -77,8 +77,12 @@ class DistanceNN(nn.Module):
         self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
         
         return self.buffer
+    
+    def reset_lstm(self):
+        self.hx = None
+        self.buffer = None
 
-    def forward(self, x, crop_coords=None):
+    def forward(self, x, crop_coords):
         if self.hx is None or self.buffer is None:
             batch_size = x.size(0)
             device = x.device
