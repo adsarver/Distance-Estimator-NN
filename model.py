@@ -4,7 +4,7 @@ from torch import nn
 import numpy as np
 
 class DistanceNN(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, batch_size, memory_stride, img_size):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size):
         super(DistanceNN, self).__init__()
         
         self.img_size = img_size
@@ -12,9 +12,8 @@ class DistanceNN(nn.Module):
         self.lstm_hidden_size = hidden_size
         self.memory_length = memory_length
         self.memory_stride = memory_stride
-        self.batch_size = batch_size
-        self.hx = self.__get_init_hidden(batch_size, 'cuda' if torch.cuda.is_available() else 'cpu')
-        self.buffer = self.__create_observation_buffer(batch_size, 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.hx = None
+        self.buffer = None
         
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1),
@@ -66,10 +65,14 @@ class DistanceNN(nn.Module):
         self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
         
         return self.buffer
-        
-        
 
     def forward(self, x, crop_coords=None):
+        if self.hx is None or self.buffer is None:
+            batch_size = x.size(0)
+            device = x.device
+            self.hx = self.__get_init_hidden(batch_size, device)
+            self.buffer = self.__create_observation_buffer(batch_size, device)
+        
         x = self.cnn(x) # Get feature maps
         combined_features = torch.cat([x, crop_coords], dim=1)  # Combine all features
         buf = self.__append_to_buffer(combined_features.unsqueeze(1)) # Update observation buffer
