@@ -1,11 +1,11 @@
 import torch
-import torch.functional as F
+import torch.nn.functional as F
 from torch import nn
 import numpy as np
 
-class DistanceNN(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size):
-        super(DistanceNN, self).__init__()
+class ContextHead(nn.Module):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64):
+        super(ContextHead, self).__init__()
         
         self.img_size = img_size
         self.lstm_num_layers = lstm_num_layers
@@ -22,41 +22,25 @@ class DistanceNN(nn.Module):
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Flatten()
+            nn.Flatten(),
         )
         
-        lstm_input = self.__get_lstm_input_size(img_size)
-        
         self.lstm = nn.LSTM(
-            input_size=lstm_input,
+            input_size=self.__get_conv_output_size(),
             hidden_size=hidden_size,
             num_layers=lstm_num_layers,
             batch_first=True
         )
-                
-        # Fully connected layers, takes LSTM output and gives distance value for every depth_stride pixels
-        self.nn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 4, 1)
-        )
         
-    def __get_lstm_input_size(self, img_size):
-        # Calculate the size of the feature map after CNN layers
-        dummy_input = torch.zeros(1, 3, img_size, img_size)
+    def __get_conv_output_size(self):
+        # Run a dummy forward through the CNN to get the exact flat output size.
+        # This is always correct regardless of img_size or number of pool layers.
+        dummy = torch.zeros(1, self.out_channels, self.img_size, self.img_size)
         with torch.no_grad():
-            feature_map = self.cnn(dummy_input)
-        feature_map_size = feature_map.size(1)
-        
-        # Add size for crop coordinates
-        lstm_input_size = feature_map_size + 4
-        
-        return lstm_input_size
+            out = self.cnn(dummy)
+        return out.shape[1]
         
     def __get_init_hidden(self, batch_size, device, transpose=False):
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
@@ -81,19 +65,223 @@ class DistanceNN(nn.Module):
     def reset_lstm(self):
         self.hx = None
         self.buffer = None
-
-    def forward(self, x, crop_coords):
+    
+    def forward(self, input_image):
         if self.hx is None or self.buffer is None:
-            batch_size = x.size(0)
-            device = x.device
-            self.hx = self.__get_init_hidden(batch_size, device)
-            self.buffer = self.__create_observation_buffer(batch_size, device)
+            device = input_image.device
+            self.hx = self.__get_init_hidden(1, device)
+            self.buffer = self.__create_observation_buffer(1, device)
+            
+        maps = self.cnn(input_image) # Get feature maps
+        buf = self.__append_to_buffer(maps) # Update observation buffer
+        lstm_out = self.lstm(buf, self.hx) # Pass through LSTM
+        self.hx = lstm_out # Update hidden state
         
-        x = self.cnn(x) # Get feature maps
-        combined_features = torch.cat([x, crop_coords], dim=1)  # Combine all features
-        buf = self.__append_to_buffer(combined_features.unsqueeze(1)) # Update observation buffer
-        x, hx = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = hx # Update hidden state
-        x = self.nn(x[:, -1, :]) # Pass through fully connected layers
+        return lstm_out[0][:, -1, :]
+    
+class ShapeHead(nn.Module):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out=16):
+        super(ShapeHead, self).__init__()
         
-        return x
+        self.lstm_num_layers = lstm_num_layers
+        self.lstm_hidden_size = hidden_size
+        self.memory_length = memory_length
+        self.memory_stride = memory_stride
+        self.hx = None
+        self.buffer = None
+        
+        self.fc = nn.Sequential(
+            nn.Linear(4, 8),
+            nn.ReLU(),
+            nn.Linear(8, fc_out),
+            nn.ReLU()
+        )
+                
+        self.lstm = nn.LSTM(
+            input_size=fc_out,
+            hidden_size=hidden_size,
+            num_layers=lstm_num_layers,
+            batch_first=True
+        )
+        
+    def __get_init_hidden(self, batch_size, device, transpose=False):
+        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
+        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
+        if transpose:
+            h0 = h0.transpose(0, 1).contiguous()
+            c0 = c0.transpose(0, 1).contiguous()
+        return (h0, c0)
+    
+    def __create_observation_buffer(self, batch_size, device):
+        return torch.zeros(batch_size, self.memory_length, self.lstm_hidden_size).to(device)
+    
+    def __append_to_buffer(self, new_obs):        
+        # Roll the buffer to make room for new observations
+        self.buffer = torch.roll(self.buffer, shifts=-self.memory_stride, dims=1)
+        
+        # Add new observations at the end
+        self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
+        
+        return self.buffer
+    
+    def reset_lstm(self):
+        self.hx = None
+        self.buffer = None
+    
+    def forward(self, box):
+        if self.hx is None or self.buffer is None:
+            device = box.device
+            self.hx = self.__get_init_hidden(1, device)
+            self.buffer = self.__create_observation_buffer(1, device)
+            
+        proj = self.fc(box) # Get feature maps
+        buf = self.__append_to_buffer(proj) # Update observation buffer
+        lstm_out = self.lstm(buf, self.hx) # Pass through LSTM
+        self.hx = lstm_out # Update hidden state
+        
+        return lstm_out[0][:, -1, :]
+    
+class ObjectHead(nn.Module):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, out_channels=64):
+        super(ObjectHead, self).__init__()
+        
+        self.lstm_num_layers = lstm_num_layers
+        self.lstm_hidden_size = hidden_size
+        self.memory_length = memory_length
+        self.memory_stride = memory_stride
+        self.hx = None
+        self.buffer = None
+        
+        self.cnn = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool2d(output_size=(3, 3)),  # (B, out_channels, 3, 3) — handles variable crop HxW
+            nn.Flatten(),                              # (B, out_channels * 9)
+        )
+        
+        self.lstm = nn.LSTM(
+            input_size=out_channels * 9,   # 3*3 spatial grid flattened
+            hidden_size=hidden_size,
+            num_layers=lstm_num_layers,
+            batch_first=True
+        )
+                
+    def __get_init_hidden(self, batch_size, device, transpose=False):
+        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
+        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
+        if transpose:
+            h0 = h0.transpose(0, 1).contiguous()
+            c0 = c0.transpose(0, 1).contiguous()
+        return (h0, c0)
+    
+    def __create_observation_buffer(self, batch_size, device):
+        return torch.zeros(batch_size, self.memory_length, self.lstm_hidden_size).to(device)
+    
+    def __append_to_buffer(self, new_obs):        
+        # Roll the buffer to make room for new observations
+        self.buffer = torch.roll(self.buffer, shifts=-self.memory_stride, dims=1)
+        
+        # Add new observations at the end
+        self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
+        
+        return self.buffer
+    
+    def reset_lstm(self):
+        self.hx = None
+        self.buffer = None
+    
+    def forward(self, crop_img):
+        if self.hx is None or self.buffer is None:
+            device = crop_img.device
+            self.hx = self.__get_init_hidden(1, device)
+            self.buffer = self.__create_observation_buffer(1, device)
+            
+        maps = self.cnn(crop_img) # Get feature maps
+        buf = self.__append_to_buffer(maps) # Update observation buffer
+        lstm_out = self.lstm(buf, self.hx) # Pass through LSTM
+        self.hx = lstm_out # Update hidden state
+        
+        return lstm_out[0][:, -1, :]
+    
+        
+class DistanceNN(nn.Module):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64, fc_out=16):
+        super(DistanceNN, self).__init__()
+        
+        self.img_size = img_size
+        self.lstm_num_layers = lstm_num_layers
+        self.lstm_hidden_size = hidden_size
+        self.memory_length = memory_length
+        self.memory_stride = memory_stride
+        
+        self.ctx_head   = ContextHead(hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels)
+        self.shape_head = ShapeHead(hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out)
+        self.obj_head   = ObjectHead(hidden_size, lstm_num_layers, memory_length, memory_stride, out_channels)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 2, hidden_size * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+        )
+        
+        self.pixel_decoder = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 4, 1),   # one depth value per pixel
+        )
+        
+    def reset_lstm(self):
+        self.ctx_head.reset_lstm()
+        self.shape_head.reset_lstm()
+        self.obj_head.reset_lstm()
+
+    def forward(self, img, crop_coords, obj_img=None, obj_dropout=0.4):
+        B = img.size(0)
+        
+        if B != 1:
+            raise ValueError("Batch size > 1 not supported in this implementation.")
+        
+        device = img.device
+
+        context = self.ctx_head(img)            # (B, hidden_size)
+        shape   = self.shape_head(crop_coords)  # (B, hidden_size)
+        bbox_h, bbox_w = crop_coords[2], crop_coords[3] # (H_box, W_box) from crop_coords
+            
+        if obj_img is not None:
+            if self.training:
+                # Randomly zero the whole obj branch with probability obj_dropout
+                if torch.rand(1).item() < obj_dropout:
+                    obj = torch.zeros(1, self.lstm_hidden_size, device=device)
+                else:
+                    obj = self.obj_head(obj_img)  # (B, hidden_size)
+            else:
+                # Eval: obj_img is only provided to get the bbox size.
+                obj = torch.zeros(1, self.lstm_hidden_size, device=device)
+        else:
+            obj = torch.zeros(1, self.lstm_hidden_size, device=device)
+        
+        combined = torch.cat([context, shape, obj], dim=1)  # (B, hidden_size * 3)
+        latent   = self.fc(combined)                        # (B, hidden_size)
+
+        # Broadcast latent to every pixel and decode independently
+        num_pixels      = bbox_h * bbox_w
+        latent_expanded = latent.unsqueeze(1).expand(1, num_pixels, -1)  # (B, H*W, hidden_size)
+        
+        # Shared MLP predicts one depth value per pixel: (B, H*W, 1) -> (B, H*W)
+        depth_flat = self.pixel_decoder(latent_expanded).squeeze(-1)     # (B, H*W)
+        
+        # Reshape to the exact bbox spatial dimensions
+        depth_map = depth_flat.view(1, bbox_h, bbox_w)                   # (B, H_box, W_box)
+        
+        return depth_map
