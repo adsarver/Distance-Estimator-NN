@@ -19,7 +19,7 @@ class RGBDDataset(Dataset):
         self.rng = np.random.default_rng(random_seed)
 
         # Get sorted color frames
-        self.color_files = sorted(glob(os.path.join(img_dir, '*-color.png')))
+        self.color_files = sorted(glob(os.path.join(img_dir, '*/*-color.png')))
 
     def __len__(self):
         return len(self.color_files)
