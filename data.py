@@ -27,9 +27,25 @@ class RGBDDataset(Dataset):
     def __getitem__(self, idx):
         # Random start frame
         start_idx = self.rng.integers(0, len(self.color_files))
-        end_idx = min(start_idx + self.max_frames * self.frame_interval, len(self.color_files))
 
-        frame_paths = self.color_files[start_idx:end_idx:self.frame_interval]
+        start_file = frame_paths[start_idx]
+        scene_name, filename = start_file.split("/")
+        start_frame = int(filename.split(".")[0])
+
+        end_frame = start_frame + self.max_frames * self.frame_interval
+
+        frame_paths = []
+
+        for i in range(start_frame, end_frame, self.frame_interval):
+            potential_path = f"{scene_name}/{i:05}-color.png"
+
+            # If the file isn't in the loop, break early
+            if potential_path not in self.color_files:
+                print(f"Broke early on {potential_path}")
+                break
+
+            frame_paths.append(potential_path)
+
         T = len(frame_paths)
 
         # Generate start & end bbox
