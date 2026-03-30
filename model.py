@@ -25,24 +25,17 @@ class ContextHead(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
         )
+        self._input_dim = out_channels * 4 * 4
         
         self.lstm = nn.LSTM(
-            input_size=self.__get_conv_output_size(),
+            input_size=self._input_dim,
             hidden_size=hidden_size,
             num_layers=lstm_num_layers,
             batch_first=True
         )
-        self._input_dim = self.lstm.input_size
-        
-    def __get_conv_output_size(self):
-        # Run a dummy forward through the CNN to get the exact flat output size.
-        # This is always correct regardless of img_size or number of pool layers.
-        dummy = torch.zeros(1, 3, self.img_size, self.img_size)
-        with torch.no_grad():
-            out = self.cnn(dummy)
-        return out.shape[1]
         
     def __get_init_hidden(self, batch_size, device, transpose=False):
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
@@ -210,7 +203,7 @@ class ObjectHead(nn.Module):
     
         
 class DistanceNN(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64, fc_out=16):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64, fc_out=16, decode_res=8):
         super(DistanceNN, self).__init__()
         
         self.img_size = img_size
@@ -218,6 +211,7 @@ class DistanceNN(nn.Module):
         self.lstm_hidden_size = hidden_size
         self.memory_length = memory_length
         self.memory_stride = memory_stride
+        self._decode_res = decode_res
         
         self.ctx_head   = ContextHead(hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels)
         self.shape_head = ShapeHead(hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out)
@@ -246,41 +240,25 @@ class DistanceNN(nn.Module):
         self.obj_head.reset_lstm()
 
     def forward(self, img, crop_coords, crop_h, crop_w, obj_img=None, obj_dropout=0.4):
-        B = img.size(0)
-        
-        if B != 1:
-            raise ValueError("Batch size > 1 not supported in this implementation.")
-        
         device = img.device
 
-        context = self.ctx_head(img)            # (B, hidden_size)
-        shape   = self.shape_head(crop_coords)  # (B, hidden_size)
-        bbox_h, bbox_w = crop_h, crop_w         # pixel-space crop dimensions
+        context = self.ctx_head(img)            # (1, hidden_size)
+        shape   = self.shape_head(crop_coords)  # (1, hidden_size)
             
-        if obj_img is not None:
-            if self.training:
-                # Randomly zero the whole obj branch with probability obj_dropout
-                if torch.rand(1).item() < obj_dropout:
-                    obj = torch.zeros(1, self.lstm_hidden_size, device=device)
-                else:
-                    obj = self.obj_head(obj_img)  # (B, hidden_size)
-            else:
-                # Eval: obj_img is only provided to get the bbox size.
-                obj = torch.zeros(1, self.lstm_hidden_size, device=device)
+        if obj_img is not None and self.training and torch.rand(1).item() >= obj_dropout:
+            obj = self.obj_head(obj_img)
         else:
             obj = torch.zeros(1, self.lstm_hidden_size, device=device)
         
-        combined = torch.cat([context, shape, obj], dim=1)  # (B, hidden_size * 3)
-        latent   = self.fc(combined)                        # (B, hidden_size)
+        combined = torch.cat([context, shape, obj], dim=1)  # (1, hidden_size * 3)
+        latent   = self.fc(combined)                        # (1, hidden_size)
 
-        # Broadcast latent to every pixel and decode independently
-        num_pixels      = bbox_h * bbox_w
-        latent_expanded = latent.unsqueeze(1).expand(1, num_pixels, -1)  # (B, H*W, hidden_size)
+        # Predict at a fixed small grid (DECODE_RES x DECODE_RES) then upsample
+        grid = self._decode_res * self._decode_res
+        latent_expanded = latent.unsqueeze(1).expand(1, grid, -1)  # (1, grid, hidden_size)
+        depth_small = self.pixel_decoder(latent_expanded).squeeze(-1)  # (1, grid)
+        depth_small = depth_small.view(1, 1, self._decode_res, self._decode_res)
         
-        # Shared MLP predicts one depth value per pixel: (B, H*W, 1) -> (B, H*W)
-        depth_flat = self.pixel_decoder(latent_expanded).squeeze(-1)     # (B, H*W)
-        
-        # Reshape to the exact bbox spatial dimensions
-        depth_map = depth_flat.view(1, bbox_h, bbox_w)                   # (B, H_box, W_box)
-        
-        return depth_map
+        depth_map = F.interpolate(depth_small, size=(crop_h, crop_w),
+                                  mode='bilinear', align_corners=False)
+        return depth_map.squeeze(1)  # (1, crop_h, crop_w)
