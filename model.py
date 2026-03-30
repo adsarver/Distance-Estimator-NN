@@ -203,7 +203,7 @@ class ObjectHead(nn.Module):
     
         
 class DistanceNN(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64, fc_out=16, decode_res=8):
+    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64, fc_out=16, decode_res=8, use_obj_head=True):
         super(DistanceNN, self).__init__()
         
         self.img_size = img_size
@@ -212,6 +212,7 @@ class DistanceNN(nn.Module):
         self.memory_length = memory_length
         self.memory_stride = memory_stride
         self._decode_res = decode_res
+        self.use_obj_head = use_obj_head
         
         self.ctx_head   = ContextHead(hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels)
         self.shape_head = ShapeHead(hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out)
@@ -244,9 +245,12 @@ class DistanceNN(nn.Module):
 
         context = self.ctx_head(img)            # (1, hidden_size)
         shape   = self.shape_head(crop_coords)  # (1, hidden_size)
-            
-        if obj_img is not None and self.training and torch.rand(1).item() >= obj_dropout:
+
+        if self.use_obj_head and obj_img is not None:
             obj = self.obj_head(obj_img)
+            # During training, randomly zero out the object branch
+            if self.training and torch.rand(1).item() < obj_dropout:
+                obj = torch.zeros_like(obj)
         else:
             obj = torch.zeros(1, self.lstm_hidden_size, device=device)
         

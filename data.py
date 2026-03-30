@@ -35,49 +35,48 @@ class RGBDDataset(Dataset):
         return len(self.scene_names)
 
     def __getitem__(self, idx):
+        """Return lightweight scene metadata — no images loaded yet."""
         scene_name = self.scene_names[idx]
         frame_paths = self.scenes[scene_name]
         T = len(frame_paths)
 
-        # Smooth random bbox trajectory across the scene
         bbox_start = self._random_bbox()
         bbox_end = self._random_bbox()
 
-        rgb_frames = []      # list of (3, H, W) tensors
-        depth_frames = []    # list of (1, H, W) tensors
-        rgb_crops = []       # list of (3, crop_h, crop_w)
-        depth_crops = []     # list of (1, crop_h, crop_w)
-        bbox_seq = []        # list of (4,) tensors
-        crop_dims = []       # list of (crop_h, crop_w) tuples
-
-        for t, path in enumerate(frame_paths):
-            rgb, depth = self._load_rgbd(path)
-            _, H, W = rgb.shape
-
-            alpha = t / max(T - 1, 1)
-            bbox = (1 - alpha) * bbox_start + alpha * bbox_end
-            cx, cy, bw, bh = bbox
-
-            top = max(0, int((cy - bh / 2) * H))
-            left = max(0, int((cx - bw / 2) * W))
-            bottom = min(H, top + int(bh * H))
-            right = min(W, left + int(bw * W))
-
-            rgb_frames.append(rgb)
-            depth_frames.append(depth)
-            rgb_crops.append(rgb[:, top:bottom, left:right])
-            depth_crops.append(depth[:, top:bottom, left:right])
-            bbox_seq.append(torch.tensor(bbox, dtype=torch.float32))
-            crop_dims.append((bottom - top, right - left))
-
         return {
             "scene": scene_name,
-            "rgb": rgb_frames,
-            "depth": depth_frames,
-            "rgb_crops": rgb_crops,
-            "depth_crops": depth_crops,
-            "bboxes": bbox_seq,
-            "crop_dims": crop_dims,
+            "frame_paths": frame_paths,
+            "T": T,
+            "bbox_start": bbox_start,
+            "bbox_end": bbox_end,
+        }
+
+    def load_frame(self, scene_meta, t):
+        """Load a single frame on demand. Returns dict with tensors for one timestep."""
+        path = scene_meta["frame_paths"][t]
+        T = scene_meta["T"]
+        bbox_start = scene_meta["bbox_start"]
+        bbox_end = scene_meta["bbox_end"]
+
+        rgb, depth = self._load_rgbd(path)
+        _, H, W = rgb.shape
+
+        alpha = t / max(T - 1, 1)
+        bbox = (1 - alpha) * bbox_start + alpha * bbox_end
+        cx, cy, bw, bh = bbox
+
+        top = max(0, int((cy - bh / 2) * H))
+        left = max(0, int((cx - bw / 2) * W))
+        bottom = min(H, top + int(bh * H))
+        right = min(W, left + int(bw * W))
+
+        return {
+            "rgb": rgb,
+            "depth": depth,
+            "rgb_crop": rgb[:, top:bottom, left:right],
+            "depth_crop": depth[:, top:bottom, left:right],
+            "bbox": torch.tensor(bbox, dtype=torch.float32),
+            "crop_dim": (bottom - top, right - left),
         }
 
     # Helper fns
@@ -87,7 +86,7 @@ class RGBDDataset(Dataset):
         rgb = cv2.cvtColor(cv2.imread(color_path), cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        depth = torch.from_numpy(depth).unsqueeze(0).float()
+        depth = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
         return rgb, depth
 
     def _random_bbox(self):
