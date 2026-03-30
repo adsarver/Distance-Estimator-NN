@@ -8,6 +8,7 @@ class ContextHead(nn.Module):
         super(ContextHead, self).__init__()
         
         self.img_size = img_size
+        self.out_channels = out_channels
         self.lstm_num_layers = lstm_num_layers
         self.lstm_hidden_size = hidden_size
         self.memory_length = memory_length
@@ -33,11 +34,12 @@ class ContextHead(nn.Module):
             num_layers=lstm_num_layers,
             batch_first=True
         )
+        self._input_dim = self.lstm.input_size
         
     def __get_conv_output_size(self):
         # Run a dummy forward through the CNN to get the exact flat output size.
         # This is always correct regardless of img_size or number of pool layers.
-        dummy = torch.zeros(1, self.out_channels, self.img_size, self.img_size)
+        dummy = torch.zeros(1, 3, self.img_size, self.img_size)
         with torch.no_grad():
             out = self.cnn(dummy)
         return out.shape[1]
@@ -51,15 +53,14 @@ class ContextHead(nn.Module):
         return (h0, c0)
     
     def __create_observation_buffer(self, batch_size, device):
-        return torch.zeros(batch_size, self.memory_length, self.lstm_hidden_size).to(device)
+        return torch.zeros(batch_size, self.memory_length, self._input_dim).to(device)
     
-    def __append_to_buffer(self, new_obs):        
-        # Roll the buffer to make room for new observations
-        self.buffer = torch.roll(self.buffer, shifts=-self.memory_stride, dims=1)
-        
-        # Add new observations at the end
-        self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
-        
+    def __append_to_buffer(self, new_obs):
+        # new_obs: (B, feat_dim) -> unsqueeze to (B, 1, feat_dim)
+        if new_obs.dim() == 2:
+            new_obs = new_obs.unsqueeze(1)
+        self.buffer = torch.roll(self.buffer, shifts=-1, dims=1)
+        self.buffer[:, -1:, :] = new_obs
         return self.buffer
     
     def reset_lstm(self):
@@ -74,10 +75,10 @@ class ContextHead(nn.Module):
             
         maps = self.cnn(input_image) # Get feature maps
         buf = self.__append_to_buffer(maps) # Update observation buffer
-        lstm_out = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = lstm_out # Update hidden state
+        lstm_out, hx_new = self.lstm(buf, self.hx) # Pass through LSTM
+        self.hx = hx_new # Update hidden state
         
-        return lstm_out[0][:, -1, :]
+        return lstm_out[:, -1, :]
     
 class ShapeHead(nn.Module):
     def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out=16):
@@ -103,6 +104,7 @@ class ShapeHead(nn.Module):
             num_layers=lstm_num_layers,
             batch_first=True
         )
+        self._input_dim = fc_out
         
     def __get_init_hidden(self, batch_size, device, transpose=False):
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
@@ -113,15 +115,13 @@ class ShapeHead(nn.Module):
         return (h0, c0)
     
     def __create_observation_buffer(self, batch_size, device):
-        return torch.zeros(batch_size, self.memory_length, self.lstm_hidden_size).to(device)
+        return torch.zeros(batch_size, self.memory_length, self._input_dim).to(device)
     
-    def __append_to_buffer(self, new_obs):        
-        # Roll the buffer to make room for new observations
-        self.buffer = torch.roll(self.buffer, shifts=-self.memory_stride, dims=1)
-        
-        # Add new observations at the end
-        self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
-        
+    def __append_to_buffer(self, new_obs):
+        if new_obs.dim() == 2:
+            new_obs = new_obs.unsqueeze(1)
+        self.buffer = torch.roll(self.buffer, shifts=-1, dims=1)
+        self.buffer[:, -1:, :] = new_obs
         return self.buffer
     
     def reset_lstm(self):
@@ -136,10 +136,10 @@ class ShapeHead(nn.Module):
             
         proj = self.fc(box) # Get feature maps
         buf = self.__append_to_buffer(proj) # Update observation buffer
-        lstm_out = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = lstm_out # Update hidden state
+        lstm_out, hx_new = self.lstm(buf, self.hx) # Pass through LSTM
+        self.hx = hx_new # Update hidden state
         
-        return lstm_out[0][:, -1, :]
+        return lstm_out[:, -1, :]
     
 class ObjectHead(nn.Module):
     def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, out_channels=64):
@@ -171,6 +171,7 @@ class ObjectHead(nn.Module):
             num_layers=lstm_num_layers,
             batch_first=True
         )
+        self._input_dim = out_channels * 9
                 
     def __get_init_hidden(self, batch_size, device, transpose=False):
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
@@ -181,15 +182,13 @@ class ObjectHead(nn.Module):
         return (h0, c0)
     
     def __create_observation_buffer(self, batch_size, device):
-        return torch.zeros(batch_size, self.memory_length, self.lstm_hidden_size).to(device)
+        return torch.zeros(batch_size, self.memory_length, self._input_dim).to(device)
     
-    def __append_to_buffer(self, new_obs):        
-        # Roll the buffer to make room for new observations
-        self.buffer = torch.roll(self.buffer, shifts=-self.memory_stride, dims=1)
-        
-        # Add new observations at the end
-        self.buffer[:, -self.memory_stride:, :] = new_obs[:, :self.memory_stride, :]
-        
+    def __append_to_buffer(self, new_obs):
+        if new_obs.dim() == 2:
+            new_obs = new_obs.unsqueeze(1)
+        self.buffer = torch.roll(self.buffer, shifts=-1, dims=1)
+        self.buffer[:, -1:, :] = new_obs
         return self.buffer
     
     def reset_lstm(self):
@@ -204,10 +203,10 @@ class ObjectHead(nn.Module):
             
         maps = self.cnn(crop_img) # Get feature maps
         buf = self.__append_to_buffer(maps) # Update observation buffer
-        lstm_out = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = lstm_out # Update hidden state
+        lstm_out, hx_new = self.lstm(buf, self.hx) # Pass through LSTM
+        self.hx = hx_new # Update hidden state
         
-        return lstm_out[0][:, -1, :]
+        return lstm_out[:, -1, :]
     
         
 class DistanceNN(nn.Module):
@@ -246,7 +245,7 @@ class DistanceNN(nn.Module):
         self.shape_head.reset_lstm()
         self.obj_head.reset_lstm()
 
-    def forward(self, img, crop_coords, obj_img=None, obj_dropout=0.4):
+    def forward(self, img, crop_coords, crop_h, crop_w, obj_img=None, obj_dropout=0.4):
         B = img.size(0)
         
         if B != 1:
@@ -256,7 +255,7 @@ class DistanceNN(nn.Module):
 
         context = self.ctx_head(img)            # (B, hidden_size)
         shape   = self.shape_head(crop_coords)  # (B, hidden_size)
-        bbox_h, bbox_w = crop_coords[2], crop_coords[3] # (H_box, W_box) from crop_coords
+        bbox_h, bbox_w = crop_h, crop_w         # pixel-space crop dimensions
             
         if obj_img is not None:
             if self.training:

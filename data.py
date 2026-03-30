@@ -1,113 +1,103 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import os
 import cv2
 import numpy as np
 from glob import glob
+from collections import defaultdict
 
 # Designed to work with the RGBD dataset from, will load one scene at a time
 
 # https://rgbd-dataset.cs.washington.edu/dataset/rgbd-scenes-v2/
 
 class RGBDDataset(Dataset):
-    def __init__(self, img_dir, transform=None, random_seed=42, max_frames=30, frame_interval=10):
+    def __init__(self, img_dir, transform=None, scene_names=None, random_seed=42):
         self.img_dir = img_dir
         self.transform = transform
-        self.max_frames = max_frames
-        self.frame_interval = frame_interval
-
         self.rng = np.random.default_rng(random_seed)
 
-        # Get sorted color frames
-        self.color_files = sorted(glob(os.path.join(img_dir, '*/*-color.png')))
+        # Group frames by scene
+        all_files = sorted(glob(os.path.join(img_dir, '*/*-color.png')))
+        scenes = defaultdict(list)
+        for f in all_files:
+            scene = os.path.basename(os.path.dirname(f))
+            scenes[scene].append(f)
+
+        # Optionally filter to a subset of scenes
+        if scene_names is not None:
+            self.scene_names = [s for s in scene_names if s in scenes]
+        else:
+            self.scene_names = sorted(scenes.keys())
+
+        self.scenes = {s: scenes[s] for s in self.scene_names}
 
     def __len__(self):
-        return len(self.color_files)
+        return len(self.scene_names)
 
     def __getitem__(self, idx):
-        # Random start frame
-        start_idx = self.rng.integers(0, len(self.color_files))
-
-        start_file = frame_paths[start_idx]
-        scene_name, filename = start_file.split("/")
-        start_frame = int(filename.split(".")[0])
-
-        end_frame = start_frame + self.max_frames * self.frame_interval
-
-        frame_paths = []
-
-        for i in range(start_frame, end_frame, self.frame_interval):
-            potential_path = f"{scene_name}/{i:05}-color.png"
-
-            # If the file isn't in the loop, break early
-            if potential_path not in self.color_files:
-                print(f"Broke early on {potential_path}")
-                break
-
-            frame_paths.append(potential_path)
-
+        scene_name = self.scene_names[idx]
+        frame_paths = self.scenes[scene_name]
         T = len(frame_paths)
 
-        # Generate start & end bbox
-        bbox_start = self.random_bbox()
-        bbox_end   = self.random_bbox()
+        # Smooth random bbox trajectory across the scene
+        bbox_start = self._random_bbox()
+        bbox_end = self._random_bbox()
 
-        rgb_seq = []
-        depth_crops = []
-        bbox_seq = []
+        rgb_frames = []      # list of (3, H, W) tensors
+        depth_frames = []    # list of (1, H, W) tensors
+        rgb_crops = []       # list of (3, crop_h, crop_w)
+        depth_crops = []     # list of (1, crop_h, crop_w)
+        bbox_seq = []        # list of (4,) tensors
+        crop_dims = []       # list of (crop_h, crop_w) tuples
 
         for t, path in enumerate(frame_paths):
-            rgb, depth = self.load_rgbd(path)
-
+            rgb, depth = self._load_rgbd(path)
             _, H, W = rgb.shape
 
-            # Linear interpolation
             alpha = t / max(T - 1, 1)
             bbox = (1 - alpha) * bbox_start + alpha * bbox_end
-
             cx, cy, bw, bh = bbox
 
-            # Convert to pixel coords
-            top = int((cy - bh / 2) * H)
-            left = int((cx - bw / 2) * W)
-            height = int(bh * H)
-            width = int(bw * W)
+            top = max(0, int((cy - bh / 2) * H))
+            left = max(0, int((cx - bw / 2) * W))
+            bottom = min(H, top + int(bh * H))
+            right = min(W, left + int(bw * W))
 
-            # Clamp
-            top = max(0, top)
-            left = max(0, left)
-            bottom = min(H, top + height)
-            right = min(W, left + width)
-
-            crop = depth[:, top:bottom, left:right]
-
-            rgb_seq.append(rgb)
-            depth_crops.append(crop)
+            rgb_frames.append(rgb)
+            depth_frames.append(depth)
+            rgb_crops.append(rgb[:, top:bottom, left:right])
+            depth_crops.append(depth[:, top:bottom, left:right])
             bbox_seq.append(torch.tensor(bbox, dtype=torch.float32))
+            crop_dims.append((bottom - top, right - left))
 
-        rgb_seq = torch.stack(rgb_seq)              # (T, 3, H, W)
-        bbox_seq = torch.stack(bbox_seq)            # (T, 4)
+        return {
+            "scene": scene_name,
+            "rgb": rgb_frames,
+            "depth": depth_frames,
+            "rgb_crops": rgb_crops,
+            "depth_crops": depth_crops,
+            "bboxes": bbox_seq,
+            "crop_dims": crop_dims,
+        }
 
-        return rgb_seq, depth_crops, bbox_seq
-    
-    def load_rgbd(self, color_path):
+    # Helper fns
+
+    def _load_rgbd(self, color_path):
         depth_path = color_path.replace('-color.png', '-depth.png')
-
-        rgb = cv2.imread(color_path)
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-
+        rgb = cv2.cvtColor(cv2.imread(color_path), cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-
         rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         depth = torch.from_numpy(depth).unsqueeze(0).float()
-
         return rgb, depth
 
-    def random_bbox(self):
+    def _random_bbox(self):
         w = 0.65 * self.rng.random() + 0.05
         h = 0.65 * self.rng.random() + 0.05
-
         cx = (1 - w) * self.rng.random() + (0.5 * w)
         cy = (1 - h) * self.rng.random() + (0.5 * h)
 
         return np.array([cx, cy, w, h])
+
+
+def scene_collate_fn(batch):
+    return batch[0]
