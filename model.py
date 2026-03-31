@@ -228,12 +228,19 @@ class DistanceNN(nn.Module):
         )
         
         self.pixel_decoder = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Linear(hidden_size + 2, hidden_size // 2),
             nn.ReLU(),
             nn.Linear(hidden_size // 2, hidden_size // 4),
             nn.ReLU(),
             nn.Linear(hidden_size // 4, 1),   # one depth value per pixel
         )
+
+        # Fixed 2-D coordinate grid for the decode resolution
+        ys = torch.linspace(-1, 1, self._decode_res)
+        xs = torch.linspace(-1, 1, self._decode_res)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        # (decode_res*decode_res, 2)
+        self.register_buffer("pos_grid", torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1))
         
     def reset_lstm(self):
         self.ctx_head.reset_lstm()
@@ -260,9 +267,11 @@ class DistanceNN(nn.Module):
         # Predict at a fixed small grid (DECODE_RES x DECODE_RES) then upsample
         grid = self._decode_res * self._decode_res
         latent_expanded = latent.unsqueeze(1).expand(1, grid, -1)  # (1, grid, hidden_size)
-        depth_small = self.pixel_decoder(latent_expanded).squeeze(-1)  # (1, grid)
+        pos = self.pos_grid.unsqueeze(0).expand(1, grid, -1)       # (1, grid, 2)
+        decoder_input = torch.cat([latent_expanded, pos], dim=-1)  # (1, grid, hidden_size+2)
+        depth_small = self.pixel_decoder(decoder_input).squeeze(-1)  # (1, grid)
         depth_small = depth_small.view(1, 1, self._decode_res, self._decode_res)
         
         depth_map = F.interpolate(depth_small, size=(crop_h, crop_w),
                                   mode='bilinear', align_corners=False)
-        return depth_map.squeeze(1)  # (1, crop_h, crop_w)
+        return torch.sigmoid(depth_map.squeeze(1))  # (1, crop_h, crop_w) in [0, 1]
