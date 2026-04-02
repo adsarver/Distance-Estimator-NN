@@ -215,13 +215,13 @@ def masked_combined_loss(pred, target, ssim_weight=0.0, window_size=7):
     return (1.0 - ssim_weight) * l1 + ssim_weight * ssim
 
 
-def uncertainty_aware_loss(pred, log_var, target):
-    """Laplacian NLL with learned per-pixel uncertainty.
+def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.5):
+    """Laplacian NLL + SSIM combined loss with learned per-pixel uncertainty.
 
-    loss = |pred - target| * exp(-s) + s   (over valid pixels only)
+    NLL  = |pred - target| * exp(-s) + s   (pixelwise, over valid pixels)
+    SSIM = structural similarity loss       (spatial structure)
 
-    This teaches the model to output high uncertainty where it expects errors
-    (e.g. during movement, occlusion) and low uncertainty where it is confident.
+    Combined: (1 - ssim_weight) * NLL + ssim_weight * SSIM
     """
     valid = target > 0
     if not valid.any():
@@ -230,7 +230,11 @@ def uncertainty_aware_loss(pred, log_var, target):
     p = pred[valid].float()
     s = log_var[valid].float()
     t = target[valid].float()
-    return (torch.abs(p - t) * torch.exp(-s) + s).mean()
+    nll = (torch.abs(p - t) * torch.exp(-s) + s).mean()
+
+    ssim = masked_ssim_loss(pred, target)
+
+    return (1.0 - ssim_weight) * nll + ssim_weight * ssim
 
 def safe_detach_head(head):
     head.hx = tuple(h.detach() for h in head.hx)
@@ -317,6 +321,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
                 # Uncertainty-aware loss for gradient; weight by valid_frac
                 loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
                 chunk_loss = chunk_loss + loss
+                
                 # Track unweighted MAE for reporting
                 with torch.no_grad():
                     valid_mask = gt_norm > 0
