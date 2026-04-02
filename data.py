@@ -11,9 +11,9 @@ from collections import defaultdict
 # https://rgbd-dataset.cs.washington.edu/dataset/rgbd-scenes-v2/
 
 class RGBDDataset(Dataset):
-    def __init__(self, img_dir, transform=None, scene_names=None, random_seed=42):
+    def __init__(self, img_dir, transforms=None, scene_names=None, random_seed=42):
         self.img_dir = img_dir
-        self.transform = transform
+        self.transforms = transforms
         self.rng = np.random.default_rng(random_seed)
 
         # Group frames by scene
@@ -31,17 +31,35 @@ class RGBDDataset(Dataset):
 
         self.scenes = {s: scenes[s] for s in self.scene_names}
 
+        # Tuple (scene_name, frame_paths, pkgd_tf)
+        if self.transforms != None:
+            self.scene_list = [(name, pkgd_tf) for name in self.scene_names for pkgd_tf in self.transforms]
+        else:
+            self.scene_list = [(name, None) for name in self.scene_names]
+
+    def _get_scene_info(self, idx):
+
+        scene_name, pkgd_tf = self.scene_list[idx]
+        frame_paths = self.scenes[scene_name]
+
+        return scene_name, frame_paths, pkgd_tf
+
     def __len__(self):
-        return len(self.scene_names)
+        return len(self.scene_list)
 
     def __getitem__(self, idx):
         """Return lightweight scene metadata — no images loaded yet."""
-        scene_name = self.scene_names[idx]
-        frame_paths = self.scenes[scene_name]
+
+        scene_name, frame_paths, pkgd_tf = self._get_scene_info(idx)
         T = len(frame_paths)
 
         bbox_start = self._random_bbox()
         bbox_end = self._random_bbox()
+
+        transform = None
+        # Choose a random transform to apply to the data
+        if self.transforms != None:
+            transform = self.transforms[self.rng.integers(0, len(self.transforms))]
 
         return {
             "scene": scene_name,
@@ -49,6 +67,7 @@ class RGBDDataset(Dataset):
             "T": T,
             "bbox_start": bbox_start,
             "bbox_end": bbox_end,
+            "pkgd_tf": pkgd_tf
         }
 
     def load_frame(self, scene_meta, t):
@@ -57,8 +76,9 @@ class RGBDDataset(Dataset):
         T = scene_meta["T"]
         bbox_start = scene_meta["bbox_start"]
         bbox_end = scene_meta["bbox_end"]
+        pkgd_tf = scene_meta["pkgd_tf"]
 
-        rgb, depth = self._load_rgbd(path)
+        rgb, depth = self._load_rgbd(path, pkgd_tf)
         _, H, W = rgb.shape
 
         alpha = t / max(T - 1, 1)
@@ -81,12 +101,20 @@ class RGBDDataset(Dataset):
 
     # Helper fns
 
-    def _load_rgbd(self, color_path):
+    def _load_rgbd(self, color_path, pkgd_transform=None):
         depth_path = color_path.replace('-color.png', '-depth.png')
         rgb = cv2.cvtColor(cv2.imread(color_path), cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         depth = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
+
+        # Apply the transforms if necessary
+        if not pkgd_transform == None:
+            rgb = pkgd_transform[0](rgb)
+
+            if pkgd_transform[1]:
+                depth = pkgd_transform[1](depth)
+
         return rgb, depth
 
     def _random_bbox(self):
