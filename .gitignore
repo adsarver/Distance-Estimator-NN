@@ -3,3 +3,6 @@ __*
 rgbd-scenes-v2/*
 rgbd-scenes-v2_imgs.zip
 test_train.py
+analysis_output/*
+training_snapshots*/
+test_video.mp4

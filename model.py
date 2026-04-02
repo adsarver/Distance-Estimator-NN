@@ -3,32 +3,167 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 
+
+class FourierPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding (NeRF-style) for 2-D coordinates.
+
+    Maps each input coordinate to [sin(2^0 π x), cos(2^0 π x), ...,
+    sin(2^{L-1} π x), cos(2^{L-1} π x)] giving 2*L features per
+    input dimension.  For 2-D input the total output size is 4*L + 2
+    (the +2 keeps the raw coordinates as well).
+    """
+
+    def __init__(self, num_frequencies: int = 10, include_raw: bool = True):
+        super().__init__()
+        self.num_frequencies = num_frequencies
+        self.include_raw = include_raw
+        freqs = 2.0 ** torch.arange(num_frequencies).float()  # (L,)
+        self.register_buffer("freqs", freqs)
+
+    @property
+    def out_dim(self):
+        """Output dimensionality for a 2-D input."""
+        d = 2 * self.num_frequencies * 2  # sin+cos for x and y
+        if self.include_raw:
+            d += 2
+        return d
+
+    def forward(self, coords):
+        # coords: (..., 2)
+        raw = coords
+        coords_freq = coords.unsqueeze(-1) * self.freqs * torch.pi  # (..., 2, L)
+        sin_enc = torch.sin(coords_freq)  # (..., 2, L)
+        cos_enc = torch.cos(coords_freq)  # (..., 2, L)
+        # Interleave and flatten last two dims → (..., 2*2*L)
+        enc = torch.cat([sin_enc, cos_enc], dim=-1).flatten(-2)  # (..., 4*L)
+        if self.include_raw:
+            enc = torch.cat([raw, enc], dim=-1)  # (..., 4*L + 2)
+        return enc
+
+class FiLMPixelDecoder(nn.Module):
+    """Pixel decoder with FiLM (Feature-wise Linear Modulation) conditioning.
+
+    Positional encoding flows through an MLP, and the latent vector generates
+    scale (gamma) and shift (beta) parameters that modulate each layer's output.
+    This ensures the latent vector cannot be ignored by the decoder.
+    """
+
+    def __init__(self, pos_dim, latent_dim, hidden_dim):
+        super().__init__()
+        self.net1 = nn.Linear(pos_dim, hidden_dim)
+        self.net2 = nn.Linear(hidden_dim, hidden_dim)
+        self.net3 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.net4 = nn.Linear(hidden_dim // 2, hidden_dim // 2)
+        self.net5 = nn.Linear(hidden_dim // 2, 1)
+
+        # FiLM generators: latent -> (gamma, beta) for each hidden layer
+        self.film1 = nn.Linear(latent_dim, hidden_dim * 2)
+        self.film2 = nn.Linear(latent_dim, hidden_dim * 2)
+        self.film3 = nn.Linear(latent_dim, (hidden_dim // 2) * 2)
+        self.film4 = nn.Linear(latent_dim, (hidden_dim // 2) * 2)
+
+        # Moderate FiLM init: enough influence without destabilizing
+        for film in [self.film1, self.film2, self.film3, self.film4]:
+            nn.init.normal_(film.weight, std=0.1)
+            nn.init.zeros_(film.bias)
+
+    def forward(self, pos_enc, latent):
+        """
+        pos_enc: (1, N, pos_dim)
+        latent:  (1, latent_dim)
+        Returns: (1, N, 1)
+        """
+        f1 = self.film1(latent).unsqueeze(1)
+        g1, b1 = f1.chunk(2, dim=-1)
+        f2 = self.film2(latent).unsqueeze(1)
+        g2, b2 = f2.chunk(2, dim=-1)
+        f3 = self.film3(latent).unsqueeze(1)
+        g3, b3 = f3.chunk(2, dim=-1)
+        f4 = self.film4(latent).unsqueeze(1)
+        g4, b4 = f4.chunk(2, dim=-1)
+
+        x = self.net1(pos_enc)                  # (1, N, hidden)
+        x = x * (1 + g1.tanh()) + b1
+        x = F.gelu(x)
+
+        x = self.net2(x)                        # (1, N, hidden)
+        x = x * (1 + g2.tanh()) + b2
+        x = F.gelu(x)
+
+        x = self.net3(x)                        # (1, N, hidden//2)
+        x = x * (1 + g3.tanh()) + b3
+        x = F.gelu(x)
+
+        x = self.net4(x)                        # (1, N, hidden//2)
+        x = x * (1 + g4.tanh()) + b4
+        x = F.gelu(x)
+
+        return self.net5(x)                     # (1, N, 1)
+
+class SpatialDecoder(nn.Module):
+    """Decode depth from CNN spatial features + LSTM latent vector.
+
+    Takes spatial features from ObjectHead's CNN (64ch @ 16×16) and the
+    combined LSTM latent (128-d, tiled spatially).  Two upsample steps
+    bring features from 16×16 → 64×64, then a final bilinear resize to
+    the requested crop resolution.
+    """
+
+    def __init__(self, latent_dim, feat_ch=64, **kwargs):
+        super().__init__()
+        in_ch = feat_ch + latent_dim  # 64 + 128 = 192
+
+        self.decoder = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 3, 1, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, 3, 1, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(32, 16, 3, 1, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(16, 2, 3, 1, 1),  # 2 = depth + log_uncertainty
+        )
+
+    def forward(self, spatial_feat, latent, out_h, out_w):
+        """
+        spatial_feat: (B, feat_ch, 16, 16)  — from ObjectHead CNN
+        latent:       (B, latent_dim)        — combined LSTM hidden state
+        Returns:      (B, 2, out_h, out_w)   — channel 0 = depth, channel 1 = log_unc
+        """
+        B, _, H, W = spatial_feat.shape
+        lat = latent.unsqueeze(-1).unsqueeze(-1).expand(B, -1, H, W)
+        x = torch.cat([spatial_feat, lat], dim=1)   # (B, feat_ch+latent, 16, 16)
+        x = self.decoder(x)                          # (B, 2, 64, 64)
+        if x.shape[2] != out_h or x.shape[3] != out_w:
+            x = F.interpolate(x, (out_h, out_w), mode='bilinear', align_corners=False)
+        return x
+
 class ContextHead(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64):
+    def __init__(self, hidden_size, lstm_num_layers, img_size, out_channels=64, avg_pool_size=(8, 8)):
         super(ContextHead, self).__init__()
         
         self.img_size = img_size
         self.out_channels = out_channels
         self.lstm_num_layers = lstm_num_layers
         self.lstm_hidden_size = hidden_size
-        self.memory_length = memory_length
-        self.memory_stride = memory_stride
         self.hx = None
-        self.buffer = None
         
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout2d(p=0.1),
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout2d(p=0.1),
             nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.AdaptiveAvgPool2d(avg_pool_size),
             nn.Flatten(),
         )
-        self._input_dim = out_channels * 4 * 4
+        self._input_dim = out_channels * avg_pool_size[0] * avg_pool_size[1]
         
         self.lstm = nn.LSTM(
             input_size=self._input_dim,
@@ -37,52 +172,31 @@ class ContextHead(nn.Module):
             batch_first=True
         )
         
-    def __get_init_hidden(self, batch_size, device, transpose=False):
-        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
-        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
-        if transpose:
-            h0 = h0.transpose(0, 1).contiguous()
-            c0 = c0.transpose(0, 1).contiguous()
+    def _get_init_hidden(self, batch_size, device):
+        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
+        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
-    
-    def __create_observation_buffer(self, batch_size, device):
-        return torch.zeros(batch_size, self.memory_length, self._input_dim).to(device)
-    
-    def __append_to_buffer(self, new_obs):
-        # new_obs: (B, feat_dim) -> unsqueeze to (B, 1, feat_dim)
-        if new_obs.dim() == 2:
-            new_obs = new_obs.unsqueeze(1)
-        self.buffer = torch.roll(self.buffer, shifts=-1, dims=1)
-        self.buffer[:, -1:, :] = new_obs
-        return self.buffer
     
     def reset_lstm(self):
         self.hx = None
-        self.buffer = None
     
     def forward(self, input_image):
-        if self.hx is None or self.buffer is None:
-            device = input_image.device
-            self.hx = self.__get_init_hidden(1, device)
-            self.buffer = self.__create_observation_buffer(1, device)
+        if self.hx is None:
+            self.hx = self._get_init_hidden(1, input_image.device)
             
-        maps = self.cnn(input_image) # Get feature maps
-        buf = self.__append_to_buffer(maps) # Update observation buffer
-        lstm_out, hx_new = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = hx_new # Update hidden state
+        maps = self.cnn(input_image)            # (B, feat_dim)
+        maps = maps.unsqueeze(1)                 # (B, 1, feat_dim) — single timestep
+        lstm_out, self.hx = self.lstm(maps, self.hx)
         
         return lstm_out[:, -1, :]
     
 class ShapeHead(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out=16):
+    def __init__(self, hidden_size, lstm_num_layers, fc_out=16):
         super(ShapeHead, self).__init__()
         
         self.lstm_num_layers = lstm_num_layers
         self.lstm_hidden_size = hidden_size
-        self.memory_length = memory_length
-        self.memory_stride = memory_stride
         self.hx = None
-        self.buffer = None
         
         self.fc = nn.Sequential(
             nn.Linear(4, 8),
@@ -97,55 +211,37 @@ class ShapeHead(nn.Module):
             num_layers=lstm_num_layers,
             batch_first=True
         )
-        self._input_dim = fc_out
         
-    def __get_init_hidden(self, batch_size, device, transpose=False):
-        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
-        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
-        if transpose:
-            h0 = h0.transpose(0, 1).contiguous()
-            c0 = c0.transpose(0, 1).contiguous()
+    def _get_init_hidden(self, batch_size, device):
+        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
+        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
-    
-    def __create_observation_buffer(self, batch_size, device):
-        return torch.zeros(batch_size, self.memory_length, self._input_dim).to(device)
-    
-    def __append_to_buffer(self, new_obs):
-        if new_obs.dim() == 2:
-            new_obs = new_obs.unsqueeze(1)
-        self.buffer = torch.roll(self.buffer, shifts=-1, dims=1)
-        self.buffer[:, -1:, :] = new_obs
-        return self.buffer
     
     def reset_lstm(self):
         self.hx = None
-        self.buffer = None
     
     def forward(self, box):
-        if self.hx is None or self.buffer is None:
-            device = box.device
-            self.hx = self.__get_init_hidden(1, device)
-            self.buffer = self.__create_observation_buffer(1, device)
+        if self.hx is None:
+            self.hx = self._get_init_hidden(1, box.device)
             
-        proj = self.fc(box) # Get feature maps
-        buf = self.__append_to_buffer(proj) # Update observation buffer
-        lstm_out, hx_new = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = hx_new # Update hidden state
+        proj = self.fc(box)                      # (B, fc_out)
+        proj = proj.unsqueeze(1)                  # (B, 1, fc_out) — single timestep
+        lstm_out, self.hx = self.lstm(proj, self.hx)
         
         return lstm_out[:, -1, :]
     
 class ObjectHead(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, out_channels=64):
+    FEAT_POOL_SIZE = 16  # spatial resolution of features passed to decoder
+
+    def __init__(self, hidden_size, lstm_num_layers, out_channels=64, avg_pool_size=(8, 8)):
         super(ObjectHead, self).__init__()
         
         self.lstm_num_layers = lstm_num_layers
         self.lstm_hidden_size = hidden_size
-        self.memory_length = memory_length
-        self.memory_stride = memory_stride
         self.hx = None
-        self.buffer = None
         
-        self.cnn = nn.Sequential(
+        # Conv layers that produce spatial feature maps
+        self.features = nn.Sequential(
             nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
@@ -154,93 +250,70 @@ class ObjectHead(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.AdaptiveMaxPool2d(output_size=(3, 3)),  # (B, out_channels, 3, 3) — handles variable crop HxW
-            nn.Flatten(),                              # (B, out_channels * 9)
         )
+
+        # Pool path for LSTM (unchanged from before)
+        self.pool = nn.Sequential(
+            nn.AdaptiveMaxPool2d(output_size=avg_pool_size),
+            nn.Flatten(),
+        )
+
+        # Fixed-size pool for spatial features sent to the decoder
+        self.feat_pool = nn.AdaptiveAvgPool2d(self.FEAT_POOL_SIZE)
+
+        self._input_dim = out_channels * avg_pool_size[0] * avg_pool_size[1]
         
         self.lstm = nn.LSTM(
-            input_size=out_channels * 9,   # 3*3 spatial grid flattened
+            input_size=self._input_dim,
             hidden_size=hidden_size,
             num_layers=lstm_num_layers,
-            batch_first=True
+            batch_first=True,
         )
-        self._input_dim = out_channels * 9
                 
-    def __get_init_hidden(self, batch_size, device, transpose=False):
-        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
-        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device)
-        if transpose:
-            h0 = h0.transpose(0, 1).contiguous()
-            c0 = c0.transpose(0, 1).contiguous()
+    def _get_init_hidden(self, batch_size, device):
+        h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
+        c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
-    
-    def __create_observation_buffer(self, batch_size, device):
-        return torch.zeros(batch_size, self.memory_length, self._input_dim).to(device)
-    
-    def __append_to_buffer(self, new_obs):
-        if new_obs.dim() == 2:
-            new_obs = new_obs.unsqueeze(1)
-        self.buffer = torch.roll(self.buffer, shifts=-1, dims=1)
-        self.buffer[:, -1:, :] = new_obs
-        return self.buffer
     
     def reset_lstm(self):
         self.hx = None
-        self.buffer = None
     
     def forward(self, crop_img):
-        if self.hx is None or self.buffer is None:
-            device = crop_img.device
-            self.hx = self.__get_init_hidden(1, device)
-            self.buffer = self.__create_observation_buffer(1, device)
-            
-        maps = self.cnn(crop_img) # Get feature maps
-        buf = self.__append_to_buffer(maps) # Update observation buffer
-        lstm_out, hx_new = self.lstm(buf, self.hx) # Pass through LSTM
-        self.hx = hx_new # Update hidden state
+        if self.hx is None:
+            self.hx = self._get_init_hidden(1, crop_img.device)
+
+        feat_maps = self.features(crop_img)      # (B, 64, H/4, W/4)
+
+        # LSTM path (unchanged)
+        pooled = self.pool(feat_maps)            # (B, 64*8*8)
+        pooled = pooled.unsqueeze(1)             # (B, 1, feat_dim)
+        lstm_out, self.hx = self.lstm(pooled, self.hx)
+
+        # Spatial features for decoder
+        spatial_feat = self.feat_pool(feat_maps) # (B, 64, 16, 16)
         
-        return lstm_out[:, -1, :]
+        return lstm_out[:, -1, :], spatial_feat
     
-        
 class DistanceNN(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels=64, fc_out=16, decode_res=8, use_obj_head=True):
+    def __init__(self, hidden_size, lstm_num_layers, img_size, out_channels=96, fc_out=16, use_obj_head=True, **kwargs):
         super(DistanceNN, self).__init__()
         
         self.img_size = img_size
         self.lstm_num_layers = lstm_num_layers
         self.lstm_hidden_size = hidden_size
-        self.memory_length = memory_length
-        self.memory_stride = memory_stride
-        self._decode_res = decode_res
         self.use_obj_head = use_obj_head
         
-        self.ctx_head   = ContextHead(hidden_size, lstm_num_layers, memory_length, memory_stride, img_size, out_channels)
-        self.shape_head = ShapeHead(hidden_size, lstm_num_layers, memory_length, memory_stride, fc_out)
-        self.obj_head   = ObjectHead(hidden_size, lstm_num_layers, memory_length, memory_stride, out_channels)
+        self.ctx_head   = ContextHead(hidden_size, lstm_num_layers, img_size, out_channels)
+        self.shape_head = ShapeHead(hidden_size, lstm_num_layers, fc_out)
+        self.obj_head   = ObjectHead(hidden_size, lstm_num_layers, out_channels)
         
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 3, hidden_size * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size * 2, hidden_size * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.LeakyReLU(0.2),
         )
         
-        self.pixel_decoder = nn.Sequential(
-            nn.Linear(hidden_size + 2, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 4, 1),   # one depth value per pixel
-        )
-
-        # Fixed 2-D coordinate grid for the decode resolution
-        ys = torch.linspace(-1, 1, self._decode_res)
-        xs = torch.linspace(-1, 1, self._decode_res)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        # (decode_res*decode_res, 2)
-        self.register_buffer("pos_grid", torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1))
+        self.obj_feat_ch = out_channels  # channels from ObjectHead CNN
+        self.decoder = SpatialDecoder(hidden_size, feat_ch=out_channels)
         
     def reset_lstm(self):
         self.ctx_head.reset_lstm()
@@ -254,24 +327,19 @@ class DistanceNN(nn.Module):
         shape   = self.shape_head(crop_coords)  # (1, hidden_size)
 
         if self.use_obj_head and obj_img is not None:
-            obj = self.obj_head(obj_img)
-            # During training, randomly zero out the object branch
-            if self.training and torch.rand(1).item() < obj_dropout:
-                obj = torch.zeros_like(obj)
+            obj, spatial_feat = self.obj_head(obj_img)  # (1, hidden_size), (1, 64, 16, 16)
         else:
             obj = torch.zeros(1, self.lstm_hidden_size, device=device)
+            spatial_feat = torch.zeros(1, self.obj_feat_ch,
+                                       ObjectHead.FEAT_POOL_SIZE,
+                                       ObjectHead.FEAT_POOL_SIZE, device=device)
         
         combined = torch.cat([context, shape, obj], dim=1)  # (1, hidden_size * 3)
-        latent   = self.fc(combined)                        # (1, hidden_size)
+        latent = self.fc(combined)                           # (1, hidden_size)
 
-        # Predict at a fixed small grid (DECODE_RES x DECODE_RES) then upsample
-        grid = self._decode_res * self._decode_res
-        latent_expanded = latent.unsqueeze(1).expand(1, grid, -1)  # (1, grid, hidden_size)
-        pos = self.pos_grid.unsqueeze(0).expand(1, grid, -1)       # (1, grid, 2)
-        decoder_input = torch.cat([latent_expanded, pos], dim=-1)  # (1, grid, hidden_size+2)
-        depth_small = self.pixel_decoder(decoder_input).squeeze(-1)  # (1, grid)
-        depth_small = depth_small.view(1, 1, self._decode_res, self._decode_res)
-        
-        depth_map = F.interpolate(depth_small, size=(crop_h, crop_w),
-                                  mode='bilinear', align_corners=False)
-        return torch.sigmoid(depth_map.squeeze(1))  # (1, crop_h, crop_w) in [0, 1]
+        depth_map = self.decoder(spatial_feat, latent, crop_h, crop_w)  # (1, 2, crop_h, crop_w)
+
+        depth   = torch.sigmoid(depth_map[:, 0:1])           # (1, 1, H, W) in [0, 1]
+        log_unc = depth_map[:, 1:2].clamp(-10, 10)           # (1, 1, H, W) clamped for stability
+
+        return depth.squeeze(1), log_unc.squeeze(1)           # (1, H, W) each
