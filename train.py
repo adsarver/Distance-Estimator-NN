@@ -15,7 +15,7 @@ if _PROJECT_ROOT is None:
 os.chdir(_PROJECT_ROOT)
 sys.path.insert(0, _PROJECT_ROOT)
 
-DATA_DIR = os.path.join(_PROJECT_ROOT, "rgbd-scenes-v2", "imgs")
+DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 
 # Force-reload local modules in case they were cached
 for _mod in ["data", "model"]:
@@ -36,12 +36,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # --- Hyperparameters ---
-IMG_SIZE = 256
+IMG_SIZE = 512
 HIDDEN_SIZE = 128
 LSTM_LAYERS = 1
 MEMORY_LENGTH = 10
 MEMORY_STRIDE = 1
-LR = 1e-3
+LR = 1e-4
 EPOCHS = 100
 TBTT_LEN = 15           # truncation window: backprop every N frames
 VAL_SPLIT = 0.25        # fraction of scenes held out for validation
@@ -70,8 +70,32 @@ n_val = max(1, int(len(all_scene_names) * VAL_SPLIT))
 val_scene_names = all_scene_names[:n_val]
 train_scene_names = all_scene_names[n_val:]
 
+# --- Train-time augmentations ---
+# Each transform is (rgb_fn, depth_fn_or_None) applied to (C,H,W) float tensors.
+import torchvision.transforms.v2 as T
+
+_color_jitter = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)
+
+def _hflip_rgb(x):
+    return x.flip(-1)
+
+def _hflip_depth(x):
+    return x.flip(-1)
+
+def _gaussian_noise_rgb(x, std=0.03):
+    return (x + torch.randn_like(x) * std).clamp(0, 1)
+
+train_transforms = [
+    (lambda x: x, None),                          # identity (unaugmented)
+    (_color_jitter, None),                         # color jitter (RGB only)
+    (_hflip_rgb, _hflip_depth),                    # horizontal flip (both)
+    (lambda x: _color_jitter(_hflip_rgb(x)),       # jitter + flip
+     _hflip_depth),
+    (_gaussian_noise_rgb, None),                   # additive Gaussian noise
+]
+
 # --- DataLoaders (one scene per batch) ---
-train_ds = RGBDDataset(DATA_DIR, scene_names=train_scene_names)
+train_ds = RGBDDataset(DATA_DIR, transforms=train_transforms, scene_names=train_scene_names)
 val_ds   = RGBDDataset(DATA_DIR, scene_names=val_scene_names, random_seed=123)
 
 def _worker_init_fn():
@@ -82,7 +106,7 @@ def _worker_init_fn():
 train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=scene_collate_fn, num_workers=0, worker_init_fn=_worker_init_fn)
 val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=scene_collate_fn, num_workers=0, worker_init_fn=_worker_init_fn)
 
-print(f"Scenes — train: {len(train_ds)}, val: {len(val_ds)}")
+print(f"Scenes — train: {len(train_scene_names)} ({len(train_ds)} with augments), val: {len(val_ds)}")
 print(f"  Train scenes: {train_scene_names}")
 print(f"  Val scenes:   {val_scene_names}")
 
@@ -133,21 +157,21 @@ if RESUME_FROM and os.path.isfile(RESUME_FROM):
     # Handle both plain state_dict and full checkpoint dict
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         partial_load_state_dict(model, ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except (ValueError, KeyError):
-                print("  Optimizer state incompatible, starting fresh optimizer")
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if "epoch" in ckpt:
-            start_epoch = ckpt["epoch"] + 1
-        if "history" in ckpt:
-            history = ckpt["history"]
-        if "best_val_loss" in ckpt:
-            best_val_loss = ckpt["best_val_loss"]
+        # if "optimizer_state_dict" in ckpt:
+        #     try:
+        #         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        #     except (ValueError, KeyError):
+        #         print("  Optimizer state incompatible, starting fresh optimizer")
+        # if "scheduler_state_dict" in ckpt:
+        #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        # if "scaler_state_dict" in ckpt:
+        #     scaler.load_state_dict(ckpt["scaler_state_dict"])
+        # if "epoch" in ckpt:
+        #     start_epoch = ckpt["epoch"] + 1
+        # if "history" in ckpt:
+        #     history = ckpt["history"]
+        # if "best_val_loss" in ckpt:
+        #     best_val_loss = ckpt["best_val_loss"]
         print(f"Resumed full checkpoint from {RESUME_FROM} (epoch {start_epoch - 1})")
     else:
         # Plain state_dict (e.g. old best_model.pt)
@@ -239,6 +263,38 @@ def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.5):
 def safe_detach_head(head):
     head.hx = tuple(h.detach() for h in head.hx)
 
+# --- Prefetch helper: load next frame from disk while GPU works on current ---
+from threading import Thread
+
+_prefetch_copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+def _prepare_frame(frame, device, img_size, depth_scale):
+    """Move a loaded frame dict to GPU tensors, returning a prepared dict.
+    This runs the interpolation and .to(device) in a dedicated CUDA stream
+    so the H2D copy overlaps with the main-stream compute."""
+    crop_h, crop_w = frame["crop_dim"]
+    if crop_h < 2 or crop_w < 2:
+        return None  # signal to skip
+
+    with torch.cuda.stream(_prefetch_copy_stream):
+        img = F.interpolate(frame["rgb"].unsqueeze(0), size=(img_size, img_size),
+                            mode="bilinear", align_corners=False).to(device, non_blocking=True)
+        bbox_t = frame["bbox"].unsqueeze(0).to(device, non_blocking=True)
+        obj_img = frame["rgb_crop"].unsqueeze(0).to(device, non_blocking=True)
+        gt_depth = frame["depth_crop"].squeeze(0).to(device, non_blocking=True)
+        gt_norm = (gt_depth / depth_scale).clamp(0, 1)
+
+    return {
+        "img": img, "bbox_t": bbox_t, "obj_img": obj_img,
+        "gt_norm": gt_norm, "crop_h": crop_h, "crop_w": crop_w,
+        "frame_cpu": frame,  # keep CPU tensors for snapshot saving
+    }
+
+def _prefetch_worker(dataset, scene_meta, t, device, img_size, depth_scale, result_slot):
+    """Load frame from disk (I/O) and prepare GPU tensors in background thread."""
+    frame = dataset.load_frame(scene_meta, t)
+    result_slot[0] = _prepare_frame(frame, device, img_size, depth_scale)
+
 def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
     """
     TBTT epoch with mixed-precision, print-based progress, and validation metrics.
@@ -250,7 +306,6 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
     mode = "Train" if is_train else "Val"
     model.train() if is_train else model.eval()
 
-    total_loss = 0.0
     total_frames = 0
     dataset = loader.dataset
     n_scenes = len(dataset)
@@ -265,8 +320,8 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
     SNAP_STRIDE = 5
     snapshots = []  # list of per-scene lists
 
-    # Separate counters for accurate loss reporting
-    report_loss_sum = 0.0
+    # Separate counters for accurate loss reporting (GPU tensor to avoid per-frame sync)
+    report_loss_acc = torch.tensor(0.0, device=device)
     report_count = 0
 
     epoch_t0 = time.time()
@@ -288,18 +343,38 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
         scene_t0 = time.time()
         scene_frames = []  # collect frames for video
 
+        # Prefetch first frame
+        next_slot = [None]
+        prefetch_t = Thread(target=_prefetch_worker,
+                            args=(dataset, scene_meta, 0, device, IMG_SIZE, DEPTH_SCALE, next_slot))
+        prefetch_t.start()
+
         for t in range(T):
-            frame = dataset.load_frame(scene_meta, t)
-            crop_h, crop_w = frame["crop_dim"]
-            if crop_h < 2 or crop_w < 2:
+            # Wait for prefetched frame
+            prefect_start = time.time()
+            prefetch_t.join()
+            prepared = next_slot[0]
+
+            # Kick off prefetch of NEXT frame while we process this one
+            if t + 1 < T:
+                next_slot = [None]
+                prefetch_t = Thread(target=_prefetch_worker,
+                                    args=(dataset, scene_meta, t + 1, device, IMG_SIZE, DEPTH_SCALE, next_slot))
+                prefetch_t.start()
+
+            if prepared is None:  # crop too small, skip
                 continue
 
-            img = F.interpolate(frame["rgb"].unsqueeze(0), size=(IMG_SIZE, IMG_SIZE),
-                                mode="bilinear", align_corners=False).to(device)
-            bbox_t = frame["bbox"].unsqueeze(0).to(device)
-            obj_img = frame["rgb_crop"].unsqueeze(0).to(device)
-            gt_depth = frame["depth_crop"].squeeze(0).to(device)
-            gt_norm = (gt_depth / DEPTH_SCALE).clamp(0, 1)
+            # Sync the copy stream before using tensors on the default stream
+            torch.cuda.current_stream().wait_stream(_prefetch_copy_stream)
+
+            img = prepared["img"]
+            bbox_t = prepared["bbox_t"]
+            obj_img = prepared["obj_img"]
+            gt_norm = prepared["gt_norm"]
+            crop_h = prepared["crop_h"]
+            crop_w = prepared["crop_w"]
+            frame = prepared["frame_cpu"]
 
             # Skip frames with too few valid depth pixels — sensor failures
             # produce misleading loss that rewards flat predictions
@@ -308,7 +383,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
                 # Still run the forward pass to keep LSTM state consistent
                 with torch.no_grad(), autocast("cuda"):
                     _ = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
-                del img, bbox_t, obj_img, gt_depth, gt_norm, frame
+                del img, bbox_t, obj_img, gt_norm, frame, prepared
                 total_frames += 1
                 chunk_frames += 1
                 continue
@@ -322,12 +397,12 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
                 loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
                 chunk_loss = chunk_loss + loss
                 
-                # Track unweighted MAE for reporting
+                # Track unweighted MAE for reporting (keep on GPU to avoid sync)
                 with torch.no_grad():
                     valid_mask = gt_norm > 0
                     if valid_mask.any():
-                        frame_mae = (pred[valid_mask].float() - gt_norm[valid_mask].float()).abs().mean().item()
-                        report_loss_sum += frame_mae
+                        frame_mae = (pred[valid_mask].float() - gt_norm[valid_mask].float()).abs().mean()
+                        report_loss_acc = report_loss_acc + frame_mae
                         report_count += 1
             else:
                 with torch.no_grad(), autocast("cuda"):
@@ -336,7 +411,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
                     log_unc = log_unc.squeeze(0)
                 frame_loss = masked_combined_loss(pred.float(), gt_norm.float())
                 chunk_loss = chunk_loss + frame_loss
-                report_loss_sum += frame_loss.item()
+                report_loss_acc = report_loss_acc + frame_loss.detach()
                 report_count += 1
 
                 # --- Per-pixel validation metrics ---
@@ -382,7 +457,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
                         "valid_pct": snap_valid_pct,
                     })
 
-            del img, bbox_t, obj_img, gt_depth, gt_norm, pred, frame
+            del img, bbox_t, obj_img, gt_norm, pred, frame, prepared
             chunk_frames += 1
             total_frames += 1
 
@@ -396,18 +471,16 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
                 scaler.step(optimizer)
                 scaler.update()
 
-                total_loss += chunk_loss.item()
                 chunk_loss = torch.tensor(0.0, device=device)
                 chunk_frames = 0
 
                 safe_detach_head(model.ctx_head)
                 safe_detach_head(model.shape_head)
                 safe_detach_head(model.obj_head)
-                torch.cuda.empty_cache()
 
-            # Periodic frame progress
+            # Periodic frame progress (sync only at print boundaries)
             if (t + 1) % PRINT_EVERY == 0:
-                running = report_loss_sum / max(report_count, 1)
+                running = report_loss_acc.item() / max(report_count, 1)
                 print(f"    [{((t+1) / T) * 100:.1f}%] Frame {t+1}/{T}  avg_mae={running:.5f}", end='\r')
 
         # Flush remaining chunk (train: backprop leftover; val: always accumulate)
@@ -420,7 +493,6 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-        total_loss += chunk_loss.item()
 
         del chunk_loss
         torch.cuda.empty_cache()
@@ -428,12 +500,14 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True):
         scene_dt = time.time() - scene_t0
         if scene_frames:
             snapshots.append(scene_frames)
+        report_loss_sum = report_loss_acc.item()  # single sync per scene
         scene_avg = report_loss_sum / max(report_count, 1)
         print(f"  [{mode}] Scene {si+1}/{n_scenes} ({scene_meta['scene']}) "
               f"| {T} frames in {scene_dt:.1f}s "
               f"| avg_mae={scene_avg:.5f}")
 
     epoch_dt = time.time() - epoch_t0
+    report_loss_sum = report_loss_acc.item()
     avg_mae = report_loss_sum / max(report_count, 1)
     print(f"  {mode} done — {total_frames} frames ({report_count} scored) in {epoch_dt:.1f}s | avg_mae={avg_mae:.6f}")
 
