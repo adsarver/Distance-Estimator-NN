@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 
-from data import RGBDDataset, scene_collate_fn
+from data import RGBDDataset, batch_scene_collate_fn
 from model import DistanceNN
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,16 +46,16 @@ print(f"Using device: {device}")
 IMG_SIZE = 480
 HIDDEN_SIZE = 128
 LSTM_LAYERS = 1
-MEMORY_LENGTH = 10
-MEMORY_STRIDE = 1
-LR = 1e-4
+LR = 5e-4
 EPOCHS = 100
-TBTT_LEN = 15           # truncation window: backprop every N frames
-VAL_SPLIT = 0.25        # fraction of scenes held out for validation
+TBTT_LEN = 10           # truncation window: backprop every N frames
+VAL_SPLIT = 0.20        # fraction of scenes held out for validation
 PRINT_EVERY = 5       # print frame progress every N frames
 DEPTH_SCALE = 29842.0  # global max depth in dataset (mm); fixed scale for consistent targets
-RESUME_FROM = "best_model.pt"  # path to checkpoint, or "" to start fresh
+RESUME_FROM = None  # path to checkpoint, or "" to start fresh
 MIN_VALID_FRAC = 0.25  # skip frames with fewer valid depth pixels than this
+BATCH_SCENES = 16      # number of scenes processed concurrently
+PREFETCH_DEPTH = 10    # number of timesteps ahead to prefetch per scene
 
 # --- Scene train/val split ---
 from glob import glob
@@ -81,37 +81,21 @@ train_scene_names = all_scene_names[n_val:]
 # Each transform is (rgb_fn, depth_fn_or_None) applied to (C,H,W) float tensors.
 import torchvision.transforms.v2 as T
 
-_color_jitter = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)
-
-def _hflip_rgb(x):
-    return x.flip(-1)
-
-def _hflip_depth(x):
-    return x.flip(-1)
-
-def _gaussian_noise_rgb(x, std=0.03):
-    return (x + torch.randn_like(x) * std).clamp(0, 1)
-
 train_transforms = [
-    (lambda x: x, None),                          # identity (unaugmented)
-    (_color_jitter, None),                         # color jitter (RGB only)
-    (_hflip_rgb, _hflip_depth),                    # horizontal flip (both)
-    (lambda x: _color_jitter(_hflip_rgb(x)),       # jitter + flip
-     _hflip_depth),
-    (_gaussian_noise_rgb, None),                   # additive Gaussian noise
+    (T.Identity(), False),
+    (T.ColorJitter(0.1, 0.1, 0.1, 0.1), False),
+    (T.RandomHorizontalFlip(1.0), True),
+    (T.RandomVerticalFlip(1.0), True),
+    (T.RandomRotation((180, 180)), True),
+    (T.JPEG(25), False),
 ]
 
 # --- DataLoaders (one scene per batch) ---
-train_ds = RGBDDataset(DATA_DIR, transforms=train_transforms, scene_names=train_scene_names)
+train_ds = RGBDDataset(DATA_DIR, transforms=None, scene_names=train_scene_names)
 val_ds   = RGBDDataset(DATA_DIR, scene_names=val_scene_names, random_seed=123)
 
-def _worker_init_fn():
-    """Re-seed each worker's numpy RNG so every worker (and epoch) gets unique random bboxes."""
-    ds = torch.utils.data.get_worker_info().dataset
-    ds.rng = np.random.default_rng(torch.initial_seed() % (2**32))
-
-train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=scene_collate_fn, num_workers=0, worker_init_fn=_worker_init_fn)
-val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=scene_collate_fn, num_workers=0, worker_init_fn=_worker_init_fn)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SCENES, shuffle=True,  collate_fn=batch_scene_collate_fn, num_workers=BATCH_SCENES)
+val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=batch_scene_collate_fn, num_workers=BATCH_SCENES)
 
 print(f"Scenes — train: {len(train_scene_names)} ({len(train_ds)} with augments), val: {len(val_ds)}")
 print(f"  Train scenes: {train_scene_names}")
@@ -270,50 +254,71 @@ def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.5):
 def safe_detach_head(head):
     head.hx = tuple(h.detach() for h in head.hx)
 
-# --- Prefetch helper: load next frame from disk while GPU works on current ---
-from threading import Thread
+# --- Prefetch helper: ThreadPoolExecutor loads frames in parallel ---
+from concurrent.futures import ThreadPoolExecutor
 
-_prefetch_copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+_prefetch_pool = ThreadPoolExecutor(max_workers=BATCH_SCENES * 2)
 
-def _prepare_frame(frame, device, img_size, depth_scale, keep_cpu=False):
-    """Move a loaded frame dict to GPU tensors, returning a prepared dict.
-    This runs the interpolation and .to(device) in a dedicated CUDA stream
-    so the H2D copy overlaps with the main-stream compute."""
-    crop_h, crop_w = frame["crop_dim"]
-    if crop_h < 2 or crop_w < 2:
-        return None  # signal to skip
-
-    with torch.cuda.stream(_prefetch_copy_stream):
-        img = F.interpolate(frame["rgb"].unsqueeze(0), size=(img_size, img_size),
-                            mode="bilinear", align_corners=False).to(device, non_blocking=True)
-        bbox_t = frame["bbox"].unsqueeze(0).to(device, non_blocking=True)
-        obj_img = frame["rgb_crop"].unsqueeze(0).to(device, non_blocking=True)
-        gt_depth = frame["depth_crop"].squeeze(0).to(device, non_blocking=True)
-        gt_norm = (gt_depth / depth_scale).clamp(0, 1)
-
-    result = {
-        "img": img, "bbox_t": bbox_t, "obj_img": obj_img,
-        "gt_norm": gt_norm, "crop_h": crop_h, "crop_w": crop_w,
-        "frame_cpu": frame if keep_cpu else None,
-    }
-    return result
-
-def _prefetch_worker(dataset, scene_meta, t, device, img_size, depth_scale, result_slot, keep_cpu=False):
-    """Load frame from disk (I/O) and prepare GPU tensors in background thread."""
+def _load_frame_cpu(dataset, scene_meta, t, img_size, depth_scale, keep_cpu=False):
+    """Load a single frame from disk, resize full image, keep original crop dims."""
+    if t >= scene_meta["T"]:
+        return None
     try:
         frame = dataset.load_frame(scene_meta, t)
-        result_slot[0] = _prepare_frame(frame, device, img_size, depth_scale, keep_cpu=keep_cpu)
     except Exception as e:
         print(f"\n  [prefetch] Error loading frame {t}: {e}")
-        result_slot[0] = None  # will be skipped in the main loop
+        return None
+
+    crop_h, crop_w = frame["crop_dim"]
+    if crop_h < 2 or crop_w < 2:
+        return None
+
+    img = F.interpolate(frame["rgb"].unsqueeze(0), size=(img_size, img_size),
+                        mode="bilinear", align_corners=False).squeeze(0)
+    bbox_t = frame["bbox"]
+    obj_img = frame["rgb_crop"]  # keep original crop size
+    gt_depth = frame["depth_crop"]  # (1, crop_h, crop_w)
+    gt_norm = (gt_depth.float() / depth_scale).clamp(0, 1).squeeze(0)  # (crop_h, crop_w)
+
+    return {
+        "img": img,
+        "bbox_t": bbox_t,
+        "obj_img": obj_img,
+        "gt_norm": gt_norm,
+        "crop_h": crop_h,
+        "crop_w": crop_w,
+        "frame_cpu": frame if keep_cpu else None,
+    }
+
+def _save_scene_state(model):
+    """Snapshot the per-scene LSTM hidden states (with grad graph intact)."""
+    return {
+        'ctx':   model.ctx_head.hx,
+        'shape': model.shape_head.hx,
+        'obj':   model.obj_head.hx,
+    }
+
+def _load_scene_state(model, state):
+    """Restore a previously saved LSTM state (or reset if None)."""
+    if state is None:
+        model.reset_lstm()
+    else:
+        model.ctx_head.hx   = state['ctx']
+        model.shape_head.hx = state['shape']
+        model.obj_head.hx   = state['obj']
+
+def _detach_scene_state(state):
+    """Detach all tensors in a saved scene state (for TBTT boundaries)."""
+    if state is None:
+        return None
+    return {k: tuple(h.detach() for h in v) for k, v in state.items()}
 
 def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
     """
-    TBTT epoch with mixed-precision, print-based progress, and validation metrics.
-    Frames are loaded lazily one at a time to avoid OOM.
+    Batched TBTT epoch: processes up to BATCH_SCENES scenes concurrently.
+    Each scene keeps its own LSTM state and dynamic crop sizes.
+    I/O is parallelised via a ThreadPoolExecutor prefetch queue.
     Returns (avg_loss, metrics_dict | None, snapshots | None).
-    During validation, captures one snapshot per scene (at ~50% through) for
-    visual comparison.
     """
     mode = "Train" if is_train else "Val"
     model.train() if is_train else model.eval()
@@ -328,156 +333,172 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
     sum_delta1 = 0
     total_val_pixels = 0
 
-    # Snapshot collector (val only): every SNAP_STRIDE-th frame per scene
+    # Snapshot collector (val only)
     SNAP_STRIDE = 5
-    snapshots = []  # list of per-scene lists
+    snapshots = []
 
-    # Separate counters for accurate loss reporting (GPU tensor to avoid per-frame sync)
+    # Loss reporting accumulators
     report_loss_acc = torch.tensor(0.0, device=device)
     report_count = 0
 
     epoch_t0 = time.time()
 
-    # Re-seed val RNG so the same bbox crop is used every epoch
     if not is_train:
         loader.dataset.rng = np.random.default_rng(123)
 
-    for si, scene_meta in enumerate(loader):
-        T = scene_meta["T"]
+    batch_idx = 0
+    for scene_batch in loader:
+        B = len(scene_batch)
+        Ts = [sm["T"] for sm in scene_batch]
+        max_T = max(Ts)
 
-        if T < 2:
-            print(f"  Scene {si+1}/{n_scenes} ({scene_meta['scene']}): too few frames, skipping.")
+        if max_T < 2:
+            batch_idx += 1
             continue
 
-        model.reset_lstm()
         chunk_loss = torch.tensor(0.0, device=device)
-        chunk_frames = 0
-        scene_t0 = time.time()
-        scene_frames = []  # collect frames for video
+        chunk_steps = 0
+        batch_t0 = time.time()
+        need_cpu = not is_train
 
-        # Prefetch first frame (keep_cpu only for val snapshot frames)
-        need_cpu = not is_train  # val mode may need CPU frames for snapshots
-        next_slot = [None]
-        prefetch_t = Thread(target=_prefetch_worker,
-                            args=(dataset, scene_meta, 0, device, IMG_SIZE, DEPTH_SCALE, next_slot, need_cpu))
-        prefetch_t.start()
+        # Per-scene LSTM states (None = fresh init)
+        scene_states = [None] * B
 
-        for t in range(T):
-            # Wait for prefetched frame
-            prefect_start = time.time()
-            prefetch_t.join()
-            prepared = next_slot[0]
-            next_slot[0] = None  # release reference immediately
+        # Per-scene video frame collectors (val only)
+        batch_scene_frames = [[] for _ in range(B)]
 
-            # Kick off prefetch of NEXT frame while we process this one
-            if t + 1 < T:
-                next_slot = [None]
-                prefetch_t = Thread(target=_prefetch_worker,
-                                    args=(dataset, scene_meta, t + 1, device, IMG_SIZE, DEPTH_SCALE, next_slot, need_cpu))
-                prefetch_t.start()
+        # Submit prefetch for first PREFETCH_DEPTH timesteps
+        futures = {}
+        for t in range(min(PREFETCH_DEPTH, max_T)):
+            for b in range(B):
+                if t < Ts[b]:
+                    futures[(b, t)] = _prefetch_pool.submit(
+                        _load_frame_cpu, dataset, scene_batch[b], t,
+                        IMG_SIZE, DEPTH_SCALE, need_cpu)
 
-            if prepared is None:  # crop too small, skip
-                continue
+        for t in range(max_T):
+            # Gather prefetched frames for this timestep
+            frames = []
+            for b in range(B):
+                key = (b, t)
+                if key in futures:
+                    frames.append(futures.pop(key).result())
+                else:
+                    frames.append(None)
 
-            # Sync the copy stream before using tensors on the default stream
-            torch.cuda.current_stream().wait_stream(_prefetch_copy_stream)
+            # Submit prefetch for future timestep
+            pf_t = t + PREFETCH_DEPTH
+            if pf_t < max_T:
+                for b in range(B):
+                    if pf_t < Ts[b]:
+                        futures[(b, pf_t)] = _prefetch_pool.submit(
+                            _load_frame_cpu, dataset, scene_batch[b], pf_t,
+                            IMG_SIZE, DEPTH_SCALE, need_cpu)
 
-            img = prepared["img"]
-            bbox_t = prepared["bbox_t"]
-            obj_img = prepared["obj_img"]
-            gt_norm = prepared["gt_norm"]
-            crop_h = prepared["crop_h"]
-            crop_w = prepared["crop_w"]
-            frame = prepared["frame_cpu"]  # None during training
+            # Process each scene individually (variable crop sizes)
+            n_alive = 0
+            for b in range(B):
+                if frames[b] is None:
+                    continue
+                n_alive += 1
 
-            # Skip frames with too few valid depth pixels — sensor failures
-            # produce misleading loss that rewards flat predictions
-            valid_frac = (gt_norm > 0).float().mean().item()
-            if valid_frac < MIN_VALID_FRAC:
-                # Still run the forward pass to keep LSTM state consistent
-                with torch.no_grad(), autocast("cuda"):
-                    _ = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
-                del img, bbox_t, obj_img, gt_norm, frame, prepared
-                total_frames += 1
-                chunk_frames += 1
-                continue
+                # Move to GPU
+                img     = frames[b]["img"].unsqueeze(0).to(device, non_blocking=True)
+                bbox_t  = frames[b]["bbox_t"].unsqueeze(0).to(device, non_blocking=True)
+                obj_img = frames[b]["obj_img"].unsqueeze(0).to(device, non_blocking=True)
+                gt_norm = frames[b]["gt_norm"].to(device, non_blocking=True)
+                crop_h  = frames[b]["crop_h"]
+                crop_w  = frames[b]["crop_w"]
+                frame   = frames[b].get("frame_cpu")
 
-            if is_train:
-                with autocast("cuda"):
-                    pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
-                    pred = pred.squeeze(0)
-                    log_unc = log_unc.squeeze(0)
-                # Uncertainty-aware loss for gradient; weight by valid_frac
-                loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
-                chunk_loss = chunk_loss + loss
-                
-                # Track unweighted MAE for reporting (keep on GPU to avoid sync)
-                with torch.no_grad():
-                    valid_mask = gt_norm > 0
-                    if valid_mask.any():
-                        frame_mae = (pred[valid_mask].float() - gt_norm[valid_mask].float()).abs().mean()
-                        report_loss_acc = report_loss_acc + frame_mae
-                        report_count += 1
-            else:
-                with torch.no_grad(), autocast("cuda"):
-                    pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
-                    pred = pred.squeeze(0)
-                    log_unc = log_unc.squeeze(0)
-                frame_loss = masked_combined_loss(pred.float(), gt_norm.float())
-                chunk_loss = chunk_loss + frame_loss
-                report_loss_acc = report_loss_acc + frame_loss.detach()
-                report_count += 1
+                # Load this scene's LSTM state
+                _load_scene_state(model, scene_states[b])
 
-                # --- Per-pixel validation metrics ---
-                valid = gt_norm > 0
-                if valid.any():
-                    p = pred[valid].float()
-                    g = gt_norm[valid].float()
-                    n_px = p.numel()
+                valid_frac = (gt_norm > 0).float().mean().item()
+                needs_loss = valid_frac >= MIN_VALID_FRAC
 
-                    sum_mae += (p - g).abs().sum().item()
-                    sum_sq_err += ((p - g) ** 2).sum().item()
-                    ratio = torch.max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
-                    sum_delta1 += (ratio < 1.25).sum().item()
-                    total_val_pixels += n_px
+                if is_train:
+                    if needs_loss:
+                        with autocast("cuda"):
+                            pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+                            pred = pred.squeeze(0)
+                            log_unc = log_unc.squeeze(0)
+                        loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
+                        chunk_loss = chunk_loss + loss
 
-                # --- Capture frames for video ---
-                if t % SNAP_STRIDE == 0:
-                    gt_norm_np = gt_norm.float().cpu().numpy()
-                    pred_np = pred.float().cpu().numpy()
-                    snap_valid = gt_norm_np > 0
-                    snap_valid_pct = float(snap_valid.mean()) * 100.0
-                    if snap_valid.any():
-                        sp, sg = pred_np[snap_valid], gt_norm_np[snap_valid]
-                        snap_mae = float(np.abs(sp - sg).mean())
-                        snap_rmse = float(np.sqrt(((sp - sg) ** 2).mean()))
-                        snap_ratio = np.maximum(sp / np.clip(sg, 1e-6, None),
-                                                sg / np.clip(sp, 1e-6, None))
-                        snap_d1 = float((snap_ratio < 1.25).mean())
+                        with torch.no_grad():
+                            vm = gt_norm > 0
+                            if vm.any():
+                                report_loss_acc = report_loss_acc + (pred[vm].float() - gt_norm[vm].float()).abs().mean()
+                                report_count += 1
                     else:
-                        snap_mae = snap_rmse = snap_d1 = 0.0
-                    scene_frames.append({
-                        "scene": scene_meta["scene"],
-                        "frame_idx": t,
-                        "T": T,
-                        "rgb_full": frame["rgb"].permute(1, 2, 0).numpy(),
-                        "rgb_crop": frame["rgb_crop"].permute(1, 2, 0).numpy(),
-                        "pred": pred_np,
-                        "gt": gt_norm_np,
-                        "uncertainty": np.exp(log_unc.float().cpu().numpy()),
-                        "mae": snap_mae,
-                        "rmse": snap_rmse,
-                        "delta1": snap_d1,
-                        "valid_pct": snap_valid_pct,
-                    })
+                        with torch.no_grad(), autocast("cuda"):
+                            _ = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+                else:
+                    with torch.no_grad(), autocast("cuda"):
+                        pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+                        pred = pred.squeeze(0)
+                        log_unc = log_unc.squeeze(0)
 
-            del img, bbox_t, obj_img, gt_norm, pred, frame, prepared
-            chunk_frames += 1
-            total_frames += 1
+                    if needs_loss:
+                        frame_loss = masked_combined_loss(pred.float(), gt_norm.float())
+                        chunk_loss = chunk_loss + frame_loss
+                        report_loss_acc = report_loss_acc + frame_loss.detach()
+                        report_count += 1
+
+                        valid = gt_norm > 0
+                        if valid.any():
+                            p = pred[valid].float()
+                            g = gt_norm[valid].float()
+                            n_px = p.numel()
+                            sum_mae += (p - g).abs().sum().item()
+                            sum_sq_err += ((p - g) ** 2).sum().item()
+                            ratio = torch.max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
+                            sum_delta1 += (ratio < 1.25).sum().item()
+                            total_val_pixels += n_px
+
+                        if t % SNAP_STRIDE == 0 and frame is not None:
+                            gt_np = gt_norm.float().cpu().numpy()
+                            pred_np = pred.float().cpu().numpy()
+                            snap_valid = gt_np > 0
+                            snap_valid_pct = float(snap_valid.mean()) * 100.0
+                            if snap_valid.any():
+                                sp, sg = pred_np[snap_valid], gt_np[snap_valid]
+                                snap_mae = float(np.abs(sp - sg).mean())
+                                snap_rmse = float(np.sqrt(((sp - sg) ** 2).mean()))
+                                snap_ratio = np.maximum(sp / np.clip(sg, 1e-6, None),
+                                                        sg / np.clip(sp, 1e-6, None))
+                                snap_d1 = float((snap_ratio < 1.25).mean())
+                            else:
+                                snap_mae = snap_rmse = snap_d1 = 0.0
+                            batch_scene_frames[b].append({
+                                "scene": scene_batch[b]["scene"],
+                                "frame_idx": t,
+                                "T": Ts[b],
+                                "rgb_full": frame["rgb"].permute(1, 2, 0).numpy(),
+                                "rgb_crop": frame["rgb_crop"].permute(1, 2, 0).numpy(),
+                                "pred": pred_np,
+                                "gt": gt_np,
+                                "uncertainty": np.exp(log_unc.float().cpu().numpy()),
+                                "mae": snap_mae,
+                                "rmse": snap_rmse,
+                                "delta1": snap_d1,
+                                "valid_pct": snap_valid_pct,
+                            })
+
+                # Save this scene's LSTM state
+                scene_states[b] = _save_scene_state(model)
+
+            if n_alive == 0:
+                continue
+
+            del frames
+            total_frames += n_alive
+            chunk_steps += 1
 
             # --- TBTT boundary ---
-            if is_train and chunk_frames % TBTT_LEN == 0:
-                avg_loss = chunk_loss / chunk_frames
+            if is_train and chunk_steps % TBTT_LEN == 0 and chunk_loss.requires_grad:
+                avg_loss = chunk_loss / chunk_steps
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(avg_loss).backward()
                 scaler.unscale_(optimizer)
@@ -486,21 +507,20 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                 scaler.update()
 
                 chunk_loss = torch.tensor(0.0, device=device)
-                chunk_frames = 0
+                chunk_steps = 0
 
-                safe_detach_head(model.ctx_head)
-                safe_detach_head(model.shape_head)
-                safe_detach_head(model.obj_head)
+                # Detach all saved scene states
+                for b in range(B):
+                    scene_states[b] = _detach_scene_state(scene_states[b])
 
-            # Periodic frame progress (sync only at print boundaries)
+            # Periodic frame progress
             if (t + 1) % PRINT_EVERY == 0:
                 running = report_loss_acc.item() / max(report_count, 1)
-                print(f"    [{((t+1) / T) * 100:.1f}%] Frame {t+1}/{T}  avg_mae={running:.5f}", end='\r')
+                print(f"    [{((t+1) / max_T) * 100:.1f}%] Frame {t+1}/{max_T} (batch {batch_idx+1})  avg_mae={running:.5f}", end='\r')
 
-        # Flush remaining chunk (train: backprop leftover; val: always accumulate)
-        leftover = chunk_frames % TBTT_LEN
-        if is_train and leftover > 0 and chunk_loss.requires_grad:
-            avg_loss = chunk_loss / leftover
+        # Flush remaining chunk
+        if is_train and chunk_steps > 0 and chunk_loss.requires_grad:
+            avg_loss = chunk_loss / chunk_steps
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(avg_loss).backward()
             scaler.unscale_(optimizer)
@@ -508,26 +528,31 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
             scaler.step(optimizer)
             scaler.update()
 
-        del chunk_loss
+        del chunk_loss, scene_states
         torch.cuda.empty_cache()
 
-        scene_dt = time.time() - scene_t0
-        if scene_frames and not is_train:
-            epoch_dir = os.path.join(SNAP_DIR, f"epoch_{epoch:03d}")
-            os.makedirs(epoch_dir, exist_ok=True)
-            _save_scene_video(scene_frames, epoch, epoch_dir)
-            snapshots.append(scene_meta["scene"])  # track saved scene names only
-        scene_frames = []  # free snapshot memory immediately
+        batch_dt = time.time() - batch_t0
 
-        # Force Python GC and return freed pages to OS to prevent RSS growth
+        # Save scene videos (val only)
+        for b in range(B):
+            if batch_scene_frames[b] and not is_train:
+                epoch_dir = os.path.join(SNAP_DIR, f"epoch_{epoch:03d}")
+                os.makedirs(epoch_dir, exist_ok=True)
+                _save_scene_video(batch_scene_frames[b], epoch, epoch_dir)
+                snapshots.append(scene_batch[b]["scene"])
+        del batch_scene_frames
+
         gc.collect()
         _malloc_trim()
 
-        report_loss_sum = report_loss_acc.item()  # single sync per scene
-        scene_avg = report_loss_sum / max(report_count, 1)
-        print(f"  [{mode}] Scene {si+1}/{n_scenes} ({scene_meta['scene']}) "
-              f"| {T} frames in {scene_dt:.1f}s "
-              f"| avg_mae={scene_avg:.5f}")
+        report_loss_sum = report_loss_acc.item()
+        batch_avg = report_loss_sum / max(report_count, 1)
+        scene_names = ", ".join(sm["scene"] for sm in scene_batch)
+        print(f"  [{mode}] Batch {batch_idx+1} ({scene_names}) "
+              f"| {sum(Ts)} frames in {batch_dt:.1f}s "
+              f"| avg_mae={batch_avg:.5f}")
+
+        batch_idx += 1
 
     epoch_dt = time.time() - epoch_t0
     report_loss_sum = report_loss_acc.item()
@@ -649,8 +674,7 @@ def _save_scene_video(scene_frames, epoch, epoch_dir):
         )
 
         fig.canvas.draw()
-        w, h = fig.canvas.get_width_height()
-        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+        buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
         rendered.append(buf)
         plt.close(fig)
 

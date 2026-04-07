@@ -85,7 +85,7 @@ class ContextHead(nn.Module):
     
     def forward(self, input_image):
         if self.hx is None:
-            self.hx = self._get_init_hidden(1, input_image.device)
+            self.hx = self._get_init_hidden(input_image.shape[0], input_image.device)
             
         maps = self.cnn(input_image)            # (B, feat_dim)
         maps = maps.unsqueeze(1)                 # (B, 1, feat_dim) — single timestep
@@ -125,7 +125,7 @@ class ShapeHead(nn.Module):
     
     def forward(self, box):
         if self.hx is None:
-            self.hx = self._get_init_hidden(1, box.device)
+            self.hx = self._get_init_hidden(box.shape[0], box.device)
             
         proj = self.fc(box)                      # (B, fc_out)
         proj = proj.unsqueeze(1)                  # (B, 1, fc_out) — single timestep
@@ -183,7 +183,7 @@ class ObjectHead(nn.Module):
     
     def forward(self, crop_img):
         if self.hx is None:
-            self.hx = self._get_init_hidden(1, crop_img.device)
+            self.hx = self._get_init_hidden(crop_img.shape[0], crop_img.device)
 
         feat_maps = self.features(crop_img)      # (B, 64, H/4, W/4)
 
@@ -224,16 +224,17 @@ class DistanceNN(nn.Module):
         self.obj_head.reset_lstm()
 
     def forward(self, img, crop_coords, crop_h, crop_w, obj_img=None, obj_dropout=0.4):
+        B = img.shape[0]
         device = img.device
 
-        context = self.ctx_head(img)            # (1, hidden_size)
-        shape   = self.shape_head(crop_coords)  # (1, hidden_size)
+        context = self.ctx_head(img)            # (B, hidden_size)
+        shape   = self.shape_head(crop_coords)  # (B, hidden_size)
 
         if self.use_obj_head and obj_img is not None:
-            obj, spatial_feat = self.obj_head(obj_img)  # (1, hidden_size), (1, 64, 16, 16)
+            obj, spatial_feat = self.obj_head(obj_img)  # (B, hidden_size), (B, 64, 16, 16)
         else:
-            obj = torch.zeros(1, self.lstm_hidden_size, device=device)
-            spatial_feat = torch.zeros(1, self.obj_feat_ch,
+            obj = torch.zeros(B, self.lstm_hidden_size, device=device)
+            spatial_feat = torch.zeros(B, self.obj_feat_ch,
                                        ObjectHead.FEAT_POOL_SIZE,
                                        ObjectHead.FEAT_POOL_SIZE, device=device)
         

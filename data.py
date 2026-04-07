@@ -111,19 +111,21 @@ class RGBDDataset(Dataset):
             return torch.zeros(3, 480, 640), torch.zeros(1, 480, 640)
         rgb = cv2.cvtColor(rgb_raw, cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-        rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+        rgb = torch.from_numpy(rgb).permute(2, 0, 1)  # uint8 (C,H,W)
         if depth is not None:
             depth = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
         else:
             # No depth available — return zeros (will be skipped by valid_frac check)
             depth = torch.zeros(1, rgb.shape[1], rgb.shape[2], dtype=torch.float32)
 
-        # Apply the transforms if necessary
+        # Apply the transforms on uint8 rgb (required by v2 transforms like JPEG/ColorJitter)
         if not pkgd_transform == None:
             rgb = pkgd_transform[0](rgb)
 
             if pkgd_transform[1]:
-                depth = pkgd_transform[1](depth)
+                depth = pkgd_transform[0](depth)
+
+        rgb = rgb.float() / 255.0
 
         return rgb, depth
 
@@ -138,3 +140,6 @@ class RGBDDataset(Dataset):
 
 def scene_collate_fn(batch):
     return batch[0]
+
+def batch_scene_collate_fn(batch):
+    return batch
