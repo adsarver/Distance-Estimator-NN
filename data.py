@@ -105,7 +105,11 @@ class RGBDDataset(Dataset):
         depth_path = color_path.replace('-color.png', '-depth.png')
         if not os.path.isfile(depth_path):
             depth_path = color_path.replace('-color.png', '-aligned-depth.png')
-        rgb = cv2.cvtColor(cv2.imread(color_path), cv2.COLOR_BGR2RGB)
+        rgb_raw = cv2.imread(color_path)
+        if rgb_raw is None:
+            # Corrupt/unreadable color image — return dummy tensors
+            return torch.zeros(3, 480, 640), torch.zeros(1, 480, 640)
+        rgb = cv2.cvtColor(rgb_raw, cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         if depth is not None:
