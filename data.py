@@ -103,10 +103,16 @@ class RGBDDataset(Dataset):
 
     def _load_rgbd(self, color_path, pkgd_transform=None):
         depth_path = color_path.replace('-color.png', '-depth.png')
+        if not os.path.isfile(depth_path):
+            depth_path = color_path.replace('-color.png', '-aligned-depth.png')
         rgb = cv2.cvtColor(cv2.imread(color_path), cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        depth = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
+        if depth is not None:
+            depth = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
+        else:
+            # No depth available — return zeros (will be skipped by valid_frac check)
+            depth = torch.zeros(1, rgb.shape[1], rgb.shape[2], dtype=torch.float32)
 
         # Apply the transforms if necessary
         if not pkgd_transform == None:

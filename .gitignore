@@ -1,6 +1,8 @@
 .*/
 __*
 data/*
+*.zip
+*.pt
 analysis_output/*
 training_snapshots*/
 test_video.mp4
