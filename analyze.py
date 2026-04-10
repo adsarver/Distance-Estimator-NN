@@ -23,7 +23,6 @@ IMG_SIZE = 256
 HIDDEN_SIZE = 128
 LSTM_LAYERS = 1
 MEMORY_LENGTH = 30
-DEPTH_SCALE = 29842.0
 MEMORY_STRIDE = 1
 VAL_SPLIT = 0.25
 
@@ -106,11 +105,18 @@ for si, scene_meta in enumerate(loader):
                             mode="bilinear", align_corners=False).to(device)
         bbox_t = frame["bbox"].unsqueeze(0).to(device)
         obj_img = frame["rgb_crop"].unsqueeze(0).to(device)
-        gt_depth = frame["depth_crop"].squeeze(0)
-        gt_norm = (gt_depth / DEPTH_SCALE).clamp(0, 1).cpu().numpy()
+        gt_depth = frame["depth_crop"].squeeze(0).float()
+
+        # Per-crop normalisation (same as training)
+        valid_gt = gt_depth > 0
+        if valid_gt.any():
+            crop_depth_max = gt_depth[valid_gt].max()
+            gt_norm = (gt_depth / crop_depth_max).clamp(0, 1).cpu().numpy()
+        else:
+            gt_norm = gt_depth.cpu().numpy()
 
         with torch.no_grad(), torch.amp.autocast("cuda"):
-            pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+            pred, log_unc, pred_scale = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
             pred = pred.squeeze(0)
             log_unc = log_unc.squeeze(0)
         pred_np = pred.float().cpu().numpy()
@@ -131,14 +137,14 @@ for si, scene_meta in enumerate(loader):
         axes[1].imshow(rgb_crop_np)
         axes[1].set_title("Cropped RGB")
 
-        vmin = min(gt_norm[gt_norm > 0].min() if (gt_norm > 0).any() else 0, pred_np.min())
-        vmax = max(gt_norm.max(), pred_np.max())
+        vmin = min(gt_np[gt_np > 0].min() if (gt_np > 0).any() else 0, pred_np.min())
+        vmax = max(gt_np.max(), pred_np.max())
 
         im_pred = axes[2].imshow(pred_np, cmap="inferno", vmin=vmin, vmax=vmax)
-        axes[2].set_title("Predicted Depth")
+        axes[2].set_title("Predicted Depth (mm)")
 
-        im_gt = axes[3].imshow(gt_norm, cmap="inferno", vmin=vmin, vmax=vmax)
-        axes[3].set_title("Ground Truth Depth")
+        im_gt = axes[3].imshow(gt_np, cmap="inferno", vmin=vmin, vmax=vmax)
+        axes[3].set_title("Ground Truth Depth (mm)")
 
         for ax in axes:
             ax.axis("off")
@@ -146,15 +152,15 @@ for si, scene_meta in enumerate(loader):
         fig.colorbar(im_gt, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
 
         # ── Per-frame metrics ─────────────────────────────────────────────
-        valid = gt_norm > 0
+        valid = gt_np > 0
         if valid.any():
-            p, g = pred_np[valid], gt_norm[valid]
+            p, g = pred_np[valid], gt_np[valid]
             mae = np.abs(p - g).mean()
             rmse = np.sqrt(((p - g) ** 2).mean())
             ratio = np.maximum(p / np.clip(g, 1e-6, None), g / np.clip(p, 1e-6, None))
             delta1 = (ratio < 1.25).mean()
             fig.suptitle(
-                f"{scene_name}  frame {t}/{T}  |  MAE={mae:.4f}  RMSE={rmse:.4f}  δ<1.25={delta1:.2%}",
+                f"{scene_name}  frame {t}/{T}  |  MAE={mae:.1f}mm  RMSE={rmse:.1f}mm  δ<1.25={delta1:.2%}",
                 fontsize=13,
             )
         else:

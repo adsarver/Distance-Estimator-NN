@@ -289,8 +289,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 _prefetch_pool = ThreadPoolExecutor(max_workers=BATCH_SCENES * 2)
 
-def _load_frame_cpu(dataset, scene_meta, t, img_size, depth_scale, keep_cpu=False):
-    """Load a single frame from disk, resize full image, keep original crop dims."""
+def _load_frame_cpu(dataset, scene_meta, t, img_size, keep_cpu=False):
+    """Load a single frame from disk, resize full image, keep original crop dims.
+    Depth is normalised per-crop by the crop's own max valid value so that
+    targets always span [0, 1] regardless of camera / depth sensor range."""
     if t >= scene_meta["T"]:
         return None
     try:
@@ -308,7 +310,16 @@ def _load_frame_cpu(dataset, scene_meta, t, img_size, depth_scale, keep_cpu=Fals
     bbox_t = frame["bbox"]
     obj_img = frame["rgb_crop"]  # keep original crop size
     gt_depth = frame["depth_crop"]  # (1, crop_h, crop_w)
-    gt_norm = (gt_depth.float() / depth_scale).clamp(0, 1).squeeze(0)  # (crop_h, crop_w)
+
+    # Per-crop depth normalisation: scale by the crop's own max valid depth
+    gt_f = gt_depth.float()
+    valid_mask = gt_f > 0
+    if valid_mask.any():
+        crop_depth_max = gt_f[valid_mask].max()
+        gt_norm = (gt_f / crop_depth_max).clamp(0, 1).squeeze(0)  # (crop_h, crop_w)
+    else:
+        crop_depth_max = 1.0
+        gt_norm = gt_f.squeeze(0)  # all zeros — will be skipped by valid_frac check
 
     return {
         "img": img,
@@ -317,6 +328,7 @@ def _load_frame_cpu(dataset, scene_meta, t, img_size, depth_scale, keep_cpu=Fals
         "gt_norm": gt_norm,
         "crop_h": crop_h,
         "crop_w": crop_w,
+        "depth_scale": float(crop_depth_max),  # for denorm in visualisation
         "frame_cpu": frame if keep_cpu else None,
     }
 
@@ -369,6 +381,8 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
 
     # Loss reporting accumulators
     report_loss_acc = torch.tensor(0.0, device=device)
+    report_depth_loss_acc = torch.tensor(0.0, device=device)
+    report_scale_loss_acc = torch.tensor(0.0, device=device)
     report_count = 0
 
     epoch_t0 = time.time()
@@ -404,7 +418,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                 if t < Ts[b]:
                     futures[(b, t)] = _prefetch_pool.submit(
                         _load_frame_cpu, dataset, scene_batch[b], t,
-                        IMG_SIZE, DEPTH_SCALE, need_cpu)
+                        IMG_SIZE, need_cpu)
 
         for t in range(max_T):
             # Gather prefetched frames for this timestep
@@ -423,7 +437,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                     if pf_t < Ts[b]:
                         futures[(b, pf_t)] = _prefetch_pool.submit(
                             _load_frame_cpu, dataset, scene_batch[b], pf_t,
-                            IMG_SIZE, DEPTH_SCALE, need_cpu)
+                            IMG_SIZE, need_cpu)
 
             # Process each scene individually (variable crop sizes)
             n_alive = 0
@@ -439,6 +453,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                 gt_norm = frames[b]["gt_norm"].to(device, non_blocking=True)
                 crop_h  = frames[b]["crop_h"]
                 crop_w  = frames[b]["crop_w"]
+                gt_scale = frames[b]["depth_scale"]  # mm, from per-crop normalisation
                 frame   = frames[b].get("frame_cpu")
 
                 # Load this scene's LSTM state
@@ -450,13 +465,18 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                 if is_train:
                     if needs_loss:
                         with autocast("cuda"):
-                            pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+                            pred, log_unc, pred_scale = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
                             pred = pred.squeeze(0)
                             log_unc = log_unc.squeeze(0)
-                        loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
+                        depth_loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
+                        # Scale loss: L1 on log-scale handles wide range of depth values
+                        scale_loss = torch.abs(torch.log(pred_scale.float() + 1) - torch.log(torch.tensor(gt_scale, device=device) + 1)).mean()
+                        loss = depth_loss + 0.1 * scale_loss
                         chunk_loss = chunk_loss + loss
 
                         with torch.no_grad():
+                            report_depth_loss_acc = report_depth_loss_acc + depth_loss.detach()
+                            report_scale_loss_acc = report_scale_loss_acc + scale_loss.detach()
                             vm = gt_norm > 0
                             if vm.any():
                                 report_loss_acc = report_loss_acc + (pred[vm].float() - gt_norm[vm].float()).abs().mean()
@@ -466,7 +486,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                             _ = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
                 else:
                     with torch.no_grad(), autocast("cuda"):
-                        pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+                        pred, log_unc, pred_scale = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
                         pred = pred.squeeze(0)
                         log_unc = log_unc.squeeze(0)
 
@@ -597,11 +617,18 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
         }
         return avg_mae, metrics, snapshots
 
+    if is_train and report_count > 0:
+        train_metrics = {
+            "depth_loss": report_depth_loss_acc.item() / report_count,
+            "scale_loss": report_scale_loss_acc.item() / report_count,
+        }
+        return avg_mae, train_metrics, None
+
     return avg_mae, None, None
 
 # --- Training Loop (TBTT, scene-level streaming via DataLoader) ---
 best_val_loss = float("inf")
-history = {"train_loss": [], "val_loss": [], "mae": [], "rmse": [], "delta1": [], "lr": []}
+history = {"train_loss": [], "val_loss": [], "mae": [], "rmse": [], "delta1": [], "lr": [], "depth_loss": [], "scale_loss": []}
 
 PLOT_DIR = os.path.join(_PROJECT_ROOT, "training_plots")
 SNAP_DIR = os.path.join(_PROJECT_ROOT, "training_snapshots")
@@ -612,7 +639,7 @@ def save_training_plots(history, plot_dir):
     """Save live training curves to disk after each epoch."""
     epochs = range(1, len(history["train_loss"]) + 1)
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
 
     # ── (0,0) Train & Val Loss ────────────────────────────────────────────
     ax = axes[0, 0]
@@ -621,8 +648,17 @@ def save_training_plots(history, plot_dir):
     ax.set_xlabel("Epoch"); ax.set_ylabel("Loss (L1)")
     ax.set_title("Train / Val Loss"); ax.legend(); ax.grid(True, alpha=0.3)
 
-    # ── (0,1) MAE & RMSE ─────────────────────────────────────────────────
+    # ── (0,1) Train Depth Loss & Scale Loss ───────────────────────────────
     ax = axes[0, 1]
+    if history.get("depth_loss"):
+        dl_epochs = range(1, len(history["depth_loss"]) + 1)
+        ax.plot(dl_epochs, history["depth_loss"], "o-", label="Depth Loss (NLL+SSIM)", markersize=3, color="tab:red")
+        ax.plot(dl_epochs, history["scale_loss"], "o-", label="Scale Loss (log-L1)", markersize=3, color="tab:purple")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
+    ax.set_title("Train Loss Components"); ax.legend(); ax.grid(True, alpha=0.3)
+
+    # ── (1,0) MAE & RMSE ─────────────────────────────────────────────────
+    ax = axes[1, 0]
     if history["mae"]:
         m_epochs = range(1, len(history["mae"]) + 1)
         ax.plot(m_epochs, history["mae"],  "o-", label="MAE",  markersize=3)
@@ -630,8 +666,8 @@ def save_training_plots(history, plot_dir):
     ax.set_xlabel("Epoch"); ax.set_ylabel("Error")
     ax.set_title("Val MAE / RMSE"); ax.legend(); ax.grid(True, alpha=0.3)
 
-    # ── (1,0) δ < 1.25 ───────────────────────────────────────────────────
-    ax = axes[1, 0]
+    # ── (1,1) δ < 1.25 ───────────────────────────────────────────────────
+    ax = axes[1, 1]
     if history["delta1"]:
         d_epochs = range(1, len(history["delta1"]) + 1)
         ax.plot(d_epochs, [d * 100 for d in history["delta1"]], "o-",
@@ -641,12 +677,15 @@ def save_training_plots(history, plot_dir):
     ax.set_title("Val δ < 1.25"); ax.legend(); ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
 
-    # ── (1,1) Learning Rate ───────────────────────────────────────────────
-    ax = axes[1, 1]
+    # ── (2,0) Learning Rate ───────────────────────────────────────────────
+    ax = axes[2, 0]
     ax.plot(epochs, history["lr"], "o-", color="orange", markersize=3)
     ax.set_xlabel("Epoch"); ax.set_ylabel("LR")
     ax.set_title("Learning Rate Schedule"); ax.grid(True, alpha=0.3)
     ax.ticklabel_format(axis="y", style="scientific", scilimits=(0, 0))
+
+    # ── (2,1) Empty ───────────────────────────────────────────────────────
+    axes[2, 1].axis("off")
 
     fig.suptitle(f"Training Progress — Epoch {len(history['train_loss'])}", fontsize=14, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -720,7 +759,7 @@ def _save_scene_video(scene_frames, epoch, epoch_dir):
 for epoch in range(start_epoch, EPOCHS + 1):
     print(f"\n{'='*50}\nEpoch {epoch}/{EPOCHS}\n{'='*50}")
     
-    train_loss, _, _ = run_epoch(train_loader, model, optimizer, scaler, device, is_train=True, epoch=epoch)
+    train_loss, train_metrics, _ = run_epoch(train_loader, model, optimizer, scaler, device, is_train=True, epoch=epoch)
     print()
     val_loss, val_metrics, val_snapshots = run_epoch(val_loader, model, optimizer, scaler, device, is_train=False, epoch=epoch)
     print()
@@ -731,6 +770,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["train_loss"].append(train_loss)
     history["val_loss"].append(val_loss)
     history["lr"].append(cur_lr)
+    if train_metrics:
+        history["depth_loss"].append(train_metrics["depth_loss"])
+        history["scale_loss"].append(train_metrics["scale_loss"])
     if val_metrics:
         history["mae"].append(val_metrics["mae"])
         history["rmse"].append(val_metrics["rmse"])
