@@ -46,15 +46,15 @@ print(f"Using device: {device}")
 IMG_SIZE = 480
 HIDDEN_SIZE = 128
 LSTM_LAYERS = 1
-LR = 5e-4
+LR = 1e-4
 EPOCHS = 100
 TBTT_LEN = 10           # truncation window: backprop every N frames
 VAL_SPLIT = 0.20        # fraction of scenes held out for validation
 PRINT_EVERY = 5       # print frame progress every N frames
 DEPTH_SCALE = 29842.0  # global max depth in dataset (mm); fixed scale for consistent targets
-RESUME_FROM = None  # path to checkpoint, or "" to start fresh
+RESUME_FROM = "last_model.pt"  # path to checkpoint, or "" to start fresh
 MIN_VALID_FRAC = 0.25  # skip frames with fewer valid depth pixels than this
-BATCH_SCENES = 16      # number of scenes processed concurrently
+BATCH_SCENES = 2      # number of scenes processed concurrently
 PREFETCH_DEPTH = 10    # number of timesteps ahead to prefetch per scene
 
 # --- Scene train/val split ---
@@ -230,13 +230,41 @@ def masked_combined_loss(pred, target, ssim_weight=0.0, window_size=7):
     return (1.0 - ssim_weight) * l1 + ssim_weight * ssim
 
 
-def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.5):
-    """Laplacian NLL + SSIM combined loss with learned per-pixel uncertainty.
+def _gradient_loss(pred, target):
+    """Edge-aware gradient loss: penalise differences in spatial derivatives.
+
+    Computes L1 between horizontal/vertical gradients of pred and target,
+    masked to valid (>0) depth pixels.  Returns scalar.
+    """
+    pred = pred.float()
+    target = target.float()
+
+    # Sobel-style finite differences (H and W)
+    pred_dy = pred[1:, :] - pred[:-1, :]
+    pred_dx = pred[:, 1:] - pred[:, :-1]
+    tgt_dy  = target[1:, :] - target[:-1, :]
+    tgt_dx  = target[:, 1:] - target[:, :-1]
+
+    # Masks: both neighbours must be valid
+    valid_y = (target[1:, :] > 0) & (target[:-1, :] > 0)
+    valid_x = (target[:, 1:] > 0) & (target[:, :-1] > 0)
+
+    if not valid_y.any() or not valid_x.any():
+        return (pred * 0).sum()
+
+    loss_y = (pred_dy[valid_y] - tgt_dy[valid_y]).abs().mean()
+    loss_x = (pred_dx[valid_x] - tgt_dx[valid_x]).abs().mean()
+    return (loss_y + loss_x) / 2.0
+
+
+def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.35, grad_weight=0.15):
+    """Laplacian NLL + SSIM + gradient combined loss.
 
     NLL  = |pred - target| * exp(-s) + s   (pixelwise, over valid pixels)
     SSIM = structural similarity loss       (spatial structure)
+    Grad = L1 between depth gradients       (edge sharpness)
 
-    Combined: (1 - ssim_weight) * NLL + ssim_weight * SSIM
+    Combined: (1 - ssim_weight - grad_weight) * NLL + ssim_weight * SSIM + grad_weight * Grad
     """
     valid = target > 0
     if not valid.any():
@@ -248,8 +276,10 @@ def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.5):
     nll = (torch.abs(p - t) * torch.exp(-s) + s).mean()
 
     ssim = masked_ssim_loss(pred, target)
+    grad = _gradient_loss(pred, target)
 
-    return (1.0 - ssim_weight) * nll + ssim_weight * ssim
+    nll_weight = 1.0 - ssim_weight - grad_weight
+    return nll_weight * nll + ssim_weight * ssim + grad_weight * grad
 
 def safe_detach_head(head):
     head.hx = tuple(h.detach() for h in head.hx)

@@ -26,7 +26,7 @@ parser.add_argument("--output", default=None, help="Output video path (default: 
 parser.add_argument("--bbox", nargs=4, type=float, default=None,
                     metavar=("CX", "CY", "W", "H"),
                     help="Fixed crop bbox in normalized coords [0-1] (default: center 0.6x0.6)")
-parser.add_argument("--img-size", type=int, default=256, help="Model input resolution")
+parser.add_argument("--img-size", type=int, default=480, help="Model input resolution")
 parser.add_argument("--no-display", action="store_true", help="Skip live window display")
 args = parser.parse_args()
 

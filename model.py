@@ -7,8 +7,8 @@ class SpatialDecoder(nn.Module):
     """Decode depth from CNN spatial features + LSTM latent vector.
 
     Takes spatial features from ObjectHead's CNN (64ch @ 16×16) and the
-    combined LSTM latent (128-d, tiled spatially).  Two upsample steps
-    bring features from 16×16 → 64×64, then a final bilinear resize to
+    combined LSTM latent (128-d, tiled spatially).  Four upsample steps
+    bring features from 16×16 → 256×256, then a final bilinear resize to
     the requested crop resolution.
     """
 
@@ -17,13 +17,24 @@ class SpatialDecoder(nn.Module):
         in_ch = feat_ch + latent_dim  # 64 + 128 = 192
 
         self.decoder = nn.Sequential(
-            nn.Conv2d(in_ch, 64, 3, 1, 1),
+            # 16×16 → 32×32
+            nn.Conv2d(in_ch, 128, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 32×32 → 64×64
+            nn.Conv2d(128, 64, 3, 1, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 64×64 → 128×128
             nn.Conv2d(64, 32, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 128×128 → 256×256
             nn.Conv2d(32, 16, 3, 1, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # final refinement
+            nn.Conv2d(16, 16, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(16, 2, 3, 1, 1),  # 2 = depth + log_uncertainty
         )
@@ -37,7 +48,7 @@ class SpatialDecoder(nn.Module):
         B, _, H, W = spatial_feat.shape
         lat = latent.unsqueeze(-1).unsqueeze(-1).expand(B, -1, H, W)
         x = torch.cat([spatial_feat, lat], dim=1)   # (B, feat_ch+latent, 16, 16)
-        x = self.decoder(x)                          # (B, 2, 64, 64)
+        x = self.decoder(x)                          # (B, 2, 256, 256)
         if x.shape[2] != out_h or x.shape[3] != out_w:
             x = F.interpolate(x, (out_h, out_w), mode='bilinear', align_corners=False)
         return x
