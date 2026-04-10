@@ -217,6 +217,15 @@ class DistanceNN(nn.Module):
         
         self.obj_feat_ch = out_channels  # channels from ObjectHead CNN
         self.decoder = SpatialDecoder(hidden_size, feat_ch=out_channels)
+
+        # Predicts absolute depth scale (mm) from latent — used to recover
+        # real-world distances from the [0,1] normalised depth map.
+        self.scale_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size // 2, 1),
+            nn.Softplus(),          # ensures positive output
+        )
         
     def reset_lstm(self):
         self.ctx_head.reset_lstm()
@@ -246,4 +255,6 @@ class DistanceNN(nn.Module):
         depth   = torch.sigmoid(depth_map[:, 0:1])           # (1, 1, H, W) in [0, 1]
         log_unc = depth_map[:, 1:2].clamp(-10, 10)           # (1, 1, H, W) clamped for stability
 
-        return depth.squeeze(1), log_unc.squeeze(1)           # (1, H, W) each
+        pred_scale = self.scale_head(latent).squeeze(-1)      # (B,) predicted depth scale in mm
+
+        return depth.squeeze(1), log_unc.squeeze(1), pred_scale  # (1,H,W), (1,H,W), (B,)

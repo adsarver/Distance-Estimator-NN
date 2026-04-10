@@ -133,7 +133,7 @@ with torch.no_grad():
 
         # Forward pass
         with torch.amp.autocast("cuda"):
-            depth, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+            depth, log_unc, pred_scale = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
 
         depth_np = depth.squeeze(0).float().cpu().numpy()   # (cH, cW) in [0,1]
         unc_np = torch.exp(log_unc.squeeze(0)).float().cpu().numpy()
