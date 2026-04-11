@@ -46,16 +46,16 @@ print(f"Using device: {device}")
 IMG_SIZE = 480
 HIDDEN_SIZE = 128
 LSTM_LAYERS = 1
-LR = 1e-4
+LR = 3e-4
 EPOCHS = 100
-TBTT_LEN = 10           # truncation window: backprop every N frames
+TBTT_LEN = 15           # truncation window: backprop every N frames
 VAL_SPLIT = 0.20        # fraction of scenes held out for validation
 PRINT_EVERY = 5       # print frame progress every N frames
 DEPTH_SCALE = 29842.0  # global max depth in dataset (mm); fixed scale for consistent targets
 RESUME_FROM = "last_model.pt"  # path to checkpoint, or "" to start fresh
 MIN_VALID_FRAC = 0.25  # skip frames with fewer valid depth pixels than this
-BATCH_SCENES = 2      # number of scenes processed concurrently
-PREFETCH_DEPTH = 10    # number of timesteps ahead to prefetch per scene
+BATCH_SCENES = 4      # number of scenes processed concurrently
+PREFETCH_DEPTH = 5    # number of timesteps ahead to prefetch per scene
 
 # --- Scene train/val split ---
 from glob import glob
@@ -108,8 +108,11 @@ model = DistanceNN(
     img_size=IMG_SIZE,
 ).to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+warmup_epochs = 5
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - warmup_epochs)
+scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 scaler = GradScaler("cuda")
 print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -257,14 +260,16 @@ def _gradient_loss(pred, target):
     return (loss_y + loss_x) / 2.0
 
 
-def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.35, grad_weight=0.15):
-    """Laplacian NLL + SSIM + gradient combined loss.
+def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.35, grad_weight=0.15, l1_weight=0.25):
+    """L1 + Laplacian NLL + SSIM + gradient combined loss.
 
+    A direct L1 term (not modulated by uncertainty) prevents the network from
+    collapsing depth loss to zero by inflating uncertainty.
+
+    L1   = |pred - target|                  (direct, not attenuated by unc.)
     NLL  = |pred - target| * exp(-s) + s   (pixelwise, over valid pixels)
     SSIM = structural similarity loss       (spatial structure)
     Grad = L1 between depth gradients       (edge sharpness)
-
-    Combined: (1 - ssim_weight - grad_weight) * NLL + ssim_weight * SSIM + grad_weight * Grad
     """
     valid = target > 0
     if not valid.any():
@@ -273,13 +278,18 @@ def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.35, grad_weight=
     p = pred[valid].float()
     s = log_var[valid].float()
     t = target[valid].float()
-    nll = (torch.abs(p - t) * torch.exp(-s) + s).mean()
+
+    l1 = torch.abs(p - t).mean()
+
+    # Clamp log-variance from below to prevent the NLL from going very negative
+    s_clamped = s.clamp(min=-4.0)
+    nll = (torch.abs(p - t) * torch.exp(-s_clamped) + s_clamped).mean()
 
     ssim = masked_ssim_loss(pred, target)
     grad = _gradient_loss(pred, target)
 
-    nll_weight = 1.0 - ssim_weight - grad_weight
-    return nll_weight * nll + ssim_weight * ssim + grad_weight * grad
+    nll_weight = 1.0 - ssim_weight - grad_weight - l1_weight
+    return l1_weight * l1 + nll_weight * nll + ssim_weight * ssim + grad_weight * grad
 
 def safe_detach_head(head):
     head.hx = tuple(h.detach() for h in head.hx)
@@ -471,7 +481,7 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                         depth_loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
                         # Scale loss: L1 on log-scale handles wide range of depth values
                         scale_loss = torch.abs(torch.log(pred_scale.float() + 1) - torch.log(torch.tensor(gt_scale, device=device) + 1)).mean()
-                        loss = depth_loss + 0.1 * scale_loss
+                        loss = depth_loss + 0.5 * scale_loss
                         chunk_loss = chunk_loss + loss
 
                         with torch.no_grad():
