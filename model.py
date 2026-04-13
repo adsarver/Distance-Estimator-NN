@@ -18,25 +18,27 @@ class SpatialDecoder(nn.Module):
 
         self.decoder = nn.Sequential(
             # 16×16 → 32×32
-            nn.Conv2d(in_ch, 128, 3, 1, 1),
+            nn.Conv2d(in_ch, 128, 3, 1, 1, padding_mode='replicate'),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout2d(p=0.2),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # 32×32 → 64×64
-            nn.Conv2d(128, 64, 3, 1, 1),
+            nn.Conv2d(128, 64, 3, 1, 1, padding_mode='replicate'),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout2d(p=0.2),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # 64×64 → 128×128
-            nn.Conv2d(64, 32, 3, 1, 1),
+            nn.Conv2d(64, 32, 3, 1, 1, padding_mode='replicate'),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # 128×128 → 256×256
-            nn.Conv2d(32, 16, 3, 1, 1),
+            nn.Conv2d(32, 16, 3, 1, 1, padding_mode='replicate'),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # final refinement
-            nn.Conv2d(16, 16, 3, 1, 1),
+            nn.Conv2d(16, 16, 3, 1, 1, padding_mode='replicate'),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(16, 2, 3, 1, 1),  # 2 = depth + log_uncertainty
+            nn.Conv2d(16, 2, 3, 1, 1, padding_mode='replicate'),  # 2 = depth + log_uncertainty
         )
 
     def forward(self, spatial_feat, latent, out_h, out_w):
@@ -67,11 +69,11 @@ class ContextHead(nn.Module):
             nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout2d(p=0.1),
+            nn.Dropout2d(p=0.3),
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout2d(p=0.1),
+            nn.Dropout2d(p=0.3),
             nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(avg_pool_size),
@@ -159,9 +161,11 @@ class ObjectHead(nn.Module):
             nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout2d(p=0.3),
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout2d(p=0.3),
             nn.Conv2d(in_channels=32, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
         )
@@ -224,20 +228,12 @@ class DistanceNN(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(hidden_size * 3, hidden_size),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
         )
         
         self.obj_feat_ch = out_channels  # channels from ObjectHead CNN
         self.decoder = SpatialDecoder(hidden_size, feat_ch=out_channels)
 
-        # Predicts absolute depth scale (mm) from latent — used to recover
-        # real-world distances from the [0,1] normalised depth map.
-        self.scale_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_size // 2, 1),
-            nn.Softplus(),          # ensures positive output
-        )
-        
     def reset_lstm(self):
         self.ctx_head.reset_lstm()
         self.shape_head.reset_lstm()
@@ -263,9 +259,10 @@ class DistanceNN(nn.Module):
 
         depth_map = self.decoder(spatial_feat, latent, crop_h, crop_w)  # (1, 2, crop_h, crop_w)
 
-        depth   = torch.sigmoid(depth_map[:, 0:1])           # (1, 1, H, W) in [0, 1]
+        # Use hard clamp instead of sigmoid to avoid gradient saturation.
+        # Sigmoid kills gradients once logits exceed ~±5, making it impossible
+        # for the model to correct edge artifacts where predictions pin to 0/1.
+        depth   = depth_map[:, 0:1].clamp(0.0, 1.0)          # (1, 1, H, W) in [0, 1]
         log_unc = depth_map[:, 1:2].clamp(-10, 10)           # (1, 1, H, W) clamped for stability
 
-        pred_scale = self.scale_head(latent).squeeze(-1)      # (B,) predicted depth scale in mm
-
-        return depth.squeeze(1), log_unc.squeeze(1), pred_scale  # (1,H,W), (1,H,W), (B,)
+        return depth.squeeze(1), log_unc.squeeze(1)  # (1,H,W), (1,H,W)
