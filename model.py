@@ -1,3 +1,5 @@
+from typing import Optional, Tuple
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -12,7 +14,7 @@ class SpatialDecoder(nn.Module):
     the requested crop resolution.
     """
 
-    def __init__(self, latent_dim, feat_ch=64, **kwargs):
+    def __init__(self, latent_dim: int, feat_ch: int = 64):
         super().__init__()
         in_ch = feat_ch + latent_dim  # 64 + 128 = 192
 
@@ -41,7 +43,7 @@ class SpatialDecoder(nn.Module):
             nn.Conv2d(16, 2, 3, 1, 1, padding_mode='replicate'),  # 2 = depth + log_uncertainty
         )
 
-    def forward(self, spatial_feat, latent, out_h, out_w):
+    def forward(self, spatial_feat: torch.Tensor, latent: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
         """
         spatial_feat: (B, feat_ch, 16, 16)  — from ObjectHead CNN
         latent:       (B, latent_dim)        — combined LSTM hidden state
@@ -55,8 +57,10 @@ class SpatialDecoder(nn.Module):
             x = F.interpolate(x, (out_h, out_w), mode='bilinear', align_corners=False)
         return x
 
-class ContextHead(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, img_size, out_channels=64, avg_pool_size=(8, 8)):
+class ContextHead(torch.nn.Module):
+    hx: Optional[Tuple[torch.Tensor, torch.Tensor]]
+
+    def __init__(self, hidden_size: int, lstm_num_layers: int, img_size: int, out_channels: int = 64, avg_pool_size: Tuple[int, int] = (8, 8)):
         super(ContextHead, self).__init__()
         
         self.img_size = img_size
@@ -88,15 +92,16 @@ class ContextHead(nn.Module):
             batch_first=True
         )
         
-    def _get_init_hidden(self, batch_size, device):
+    def _get_init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
     
-    def reset_lstm(self):
+    @torch.jit.export
+    def reset_lstm(self) -> None:
         self.hx = None
     
-    def forward(self, input_image):
+    def forward(self, input_image: torch.Tensor) -> torch.Tensor:
         if self.hx is None:
             self.hx = self._get_init_hidden(input_image.shape[0], input_image.device)
             
@@ -106,8 +111,10 @@ class ContextHead(nn.Module):
         
         return lstm_out[:, -1, :]
     
-class ShapeHead(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, fc_out=16):
+class ShapeHead(torch.nn.Module):
+    hx: Optional[Tuple[torch.Tensor, torch.Tensor]]
+
+    def __init__(self, hidden_size: int, lstm_num_layers: int, fc_out: int = 16):
         super(ShapeHead, self).__init__()
         
         self.lstm_num_layers = lstm_num_layers
@@ -128,15 +135,16 @@ class ShapeHead(nn.Module):
             batch_first=True
         )
         
-    def _get_init_hidden(self, batch_size, device):
+    def _get_init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
     
-    def reset_lstm(self):
+    @torch.jit.export
+    def reset_lstm(self) -> None:
         self.hx = None
     
-    def forward(self, box):
+    def forward(self, box: torch.Tensor) -> torch.Tensor:
         if self.hx is None:
             self.hx = self._get_init_hidden(box.shape[0], box.device)
             
@@ -146,10 +154,11 @@ class ShapeHead(nn.Module):
         
         return lstm_out[:, -1, :]
     
-class ObjectHead(nn.Module):
-    FEAT_POOL_SIZE = 16  # spatial resolution of features passed to decoder
+class ObjectHead(torch.nn.Module):
+    hx: Optional[Tuple[torch.Tensor, torch.Tensor]]
+    FEAT_POOL_SIZE: int = 16  # spatial resolution of features passed to decoder
 
-    def __init__(self, hidden_size, lstm_num_layers, out_channels=64, avg_pool_size=(8, 8)):
+    def __init__(self, hidden_size: int, lstm_num_layers: int, out_channels: int = 64, avg_pool_size: Tuple[int, int] = (8, 8)):
         super(ObjectHead, self).__init__()
         
         self.lstm_num_layers = lstm_num_layers
@@ -188,15 +197,16 @@ class ObjectHead(nn.Module):
             batch_first=True,
         )
                 
-    def _get_init_hidden(self, batch_size, device):
+    def _get_init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         h0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         c0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
     
-    def reset_lstm(self):
+    @torch.jit.export
+    def reset_lstm(self) -> None:
         self.hx = None
     
-    def forward(self, crop_img):
+    def forward(self, crop_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.hx is None:
             self.hx = self._get_init_hidden(crop_img.shape[0], crop_img.device)
 
@@ -212,8 +222,8 @@ class ObjectHead(nn.Module):
         
         return lstm_out[:, -1, :], spatial_feat
     
-class DistanceNN(nn.Module):
-    def __init__(self, hidden_size, lstm_num_layers, img_size, out_channels=96, fc_out=16, use_obj_head=True, **kwargs):
+class DistanceNN(torch.nn.Module):
+    def __init__(self, hidden_size: int, lstm_num_layers: int, img_size: int, out_channels: int = 96, fc_out: int = 16, use_obj_head: bool = True):
         super(DistanceNN, self).__init__()
         
         self.img_size = img_size
@@ -232,14 +242,16 @@ class DistanceNN(nn.Module):
         )
         
         self.obj_feat_ch = out_channels  # channels from ObjectHead CNN
+        self.feat_pool_size = ObjectHead.FEAT_POOL_SIZE
         self.decoder = SpatialDecoder(hidden_size, feat_ch=out_channels)
 
-    def reset_lstm(self):
+    @torch.jit.export
+    def reset_lstm(self) -> None:
         self.ctx_head.reset_lstm()
         self.shape_head.reset_lstm()
         self.obj_head.reset_lstm()
 
-    def forward(self, img, crop_coords, crop_h, crop_w, obj_img=None, obj_dropout=0.4):
+    def forward(self, img: torch.Tensor, crop_coords: torch.Tensor, crop_h: int, crop_w: int, obj_img: Optional[torch.Tensor] = None, obj_dropout: float = 0.4) -> Tuple[torch.Tensor, torch.Tensor]:
         B = img.shape[0]
         device = img.device
 
@@ -251,8 +263,8 @@ class DistanceNN(nn.Module):
         else:
             obj = torch.zeros(B, self.lstm_hidden_size, device=device)
             spatial_feat = torch.zeros(B, self.obj_feat_ch,
-                                       ObjectHead.FEAT_POOL_SIZE,
-                                       ObjectHead.FEAT_POOL_SIZE, device=device)
+                                       self.feat_pool_size,
+                                       self.feat_pool_size, device=device)
         
         combined = torch.cat([context, shape, obj], dim=1)  # (1, hidden_size * 3)
         latent = self.fc(combined)                           # (1, hidden_size)
