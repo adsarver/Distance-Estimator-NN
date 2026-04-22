@@ -1,9 +1,9 @@
 import os, sys, subprocess, importlib, shutil, time, gc, ctypes, math
 
 # Prevent threading-related segfaults
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+# os.environ["OMP_NUM_THREADS"] = "1"
+# os.environ["MKL_NUM_THREADS"] = "1"
+# os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import numpy as np
 
@@ -42,7 +42,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 
-from data import RGBDDataset, batch_scene_collate_fn
+from data import RGBDDataset, scene_collate_fn
 from model import DistanceNN
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -56,13 +56,11 @@ LR = 3e-4
 EPOCHS = 300
 TBTT_LEN = 15           # truncation window: backprop every N frames
 VAL_SPLIT = 0.20        # fraction of scenes held out for validation
-PRINT_EVERY = 5       # print frame progress every N frames
+PRINT_EVERY = 50       # print frame progress every N frames
 DEPTH_SCALE = 65535.0  # global max depth in dataset (mm); uint16 max, covers all scenes
-LOG_DEPTH_SCALE = math.log(DEPTH_SCALE + 1)  # denominator for log-depth normalisation
+
 RESUME_FROM = "last_model.pt"  # path to checkpoint, or "" to start fresh
 MIN_VALID_FRAC = 0.25  # skip frames with fewer valid depth pixels than this
-BATCH_SCENES = 12      # number of scenes processed concurrently
-PREFETCH_DEPTH = 15    # number of timesteps ahead to prefetch per scene
 
 # --- Scene train/val split ---
 from glob import glob
@@ -98,11 +96,20 @@ train_transforms = [
 ]
 
 # --- DataLoaders (one scene per batch) ---
-train_ds = RGBDDataset(DATA_DIR, transforms=train_transforms, scene_names=train_scene_names)
-val_ds   = RGBDDataset(DATA_DIR, scene_names=val_scene_names, random_seed=123)
+def _worker_init_fn(worker_id):
+    """Reseed RNG and disable OpenCV threading in each DataLoader worker."""
+    import cv2 as _cv2
+    _cv2.setNumThreads(0)
+    _cv2.ocl.setUseOpenCL(False)
+    info = torch.utils.data.get_worker_info()
+    if info is not None:
+        info.dataset.rng = np.random.default_rng(info.dataset.rng.integers(2**31) + worker_id)
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SCENES, shuffle=True,  collate_fn=batch_scene_collate_fn, num_workers=4)
-val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=batch_scene_collate_fn, num_workers=4)
+train_ds = RGBDDataset(DATA_DIR, transforms=train_transforms, scene_names=train_scene_names, img_size=IMG_SIZE)
+val_ds   = RGBDDataset(DATA_DIR, scene_names=val_scene_names, random_seed=123, img_size=IMG_SIZE, keep_raw=True)
+
+train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=scene_collate_fn, num_workers=2, worker_init_fn=_worker_init_fn, prefetch_factor=1)
+val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=scene_collate_fn, num_workers=1, worker_init_fn=_worker_init_fn, prefetch_factor=1)
 
 print(f"Scenes — train: {len(train_scene_names)} ({len(train_ds)} with augments), val: {len(val_ds)}")
 print(f"  Train scenes: {train_scene_names}")
@@ -116,7 +123,7 @@ model = DistanceNN(
 ).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-warmup_epochs = 5
+warmup_epochs = 0
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - warmup_epochs)
 scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
@@ -160,21 +167,21 @@ if RESUME_FROM and os.path.isfile(RESUME_FROM):
     # Handle both plain state_dict and full checkpoint dict
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         partial_load_state_dict(model, ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except (ValueError, KeyError):
-                print("  Optimizer state incompatible, starting fresh optimizer")
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if "epoch" in ckpt:
-            start_epoch = ckpt["epoch"] + 1
-        if "history" in ckpt:
-            history = ckpt["history"]
-        if "best_val_loss" in ckpt:
-            best_val_loss = ckpt["best_val_loss"]
+        # if "optimizer_state_dict" in ckpt:
+        #     try:
+        #         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        #     except (ValueError, KeyError):
+        #         print("  Optimizer state incompatible, starting fresh optimizer")
+        # if "scheduler_state_dict" in ckpt:
+        #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        # if "scaler_state_dict" in ckpt:
+        #     scaler.load_state_dict(ckpt["scaler_state_dict"])
+        # if "epoch" in ckpt:
+        #     start_epoch = ckpt["epoch"] + 1
+        # if "history" in ckpt:
+        #     history = ckpt["history"]
+        # if "best_val_loss" in ckpt:
+        #     best_val_loss = ckpt["best_val_loss"]
         print(f"Resumed full checkpoint from {RESUME_FROM} (epoch {start_epoch - 1})")
     else:
         # Plain state_dict (e.g. old best_model.pt)
@@ -305,196 +312,21 @@ def uncertainty_aware_loss(pred, log_var, target, ssim_weight=0.35, grad_weight=
 def safe_detach_head(head):
     head.hx = tuple(h.detach() for h in head.hx)
 
-# --- Frame loading helper with process-based prefetch ---
-import cv2
-cv2.setNumThreads(0)  # Disable OpenCV threading entirely
-cv2.ocl.setUseOpenCL(False)  # Disable OpenCL
-
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
-
-# Use fork (default on Linux) - safe since workers only do CPU ops (cv2/numpy/torch CPU)
-# 'spawn' would re-import module and trigger training loop in child processes
-_mp_context = mp.get_context("fork")
-_prefetch_pool = None  # Initialized lazily
-PREFETCH_TIMEOUT = 30.0  # seconds to wait for a frame before assuming crash
-
-def _init_prefetch_pool():
-    """Initialize the prefetch pool (lazy init)."""
-    global _prefetch_pool
-    if _prefetch_pool is None:
-        _prefetch_pool = ProcessPoolExecutor(
-            max_workers=4, 
-            mp_context=_mp_context,
-            # No initializer needed - fork inherits cv2 settings from parent
-        )
-    return _prefetch_pool
-
-def _load_frame_standalone(frame_path, bbox_start, bbox_end, t, T, pkgd_tf_idx, img_size, keep_cpu, log_depth_scale):
-    """Standalone frame loader for subprocess - no Dataset dependency.
-    All cv2/numpy ops happen in the subprocess, crash-isolated from main."""
-    import cv2
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-    import math
-    
-    try:
-        # Load RGB
-        depth_path = frame_path.replace('-color.png', '-depth.png')
-        import os
-        if not os.path.isfile(depth_path):
-            depth_path = frame_path.replace('-color.png', '-aligned-depth.png')
-        
-        rgb_raw = cv2.imread(frame_path)
-        if rgb_raw is None:
-            print(f"  [worker] Failed to read: {frame_path}")
-            return None
-        rgb = cv2.cvtColor(rgb_raw, cv2.COLOR_BGR2RGB)
-        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-        
-        rgb = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        _, H, W = rgb.shape
-        
-        if depth is not None:
-            depth = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0)
-        else:
-            depth = torch.zeros(1, H, W, dtype=torch.float32)
-        
-        # Compute bbox for this timestep
-        alpha = t / max(T - 1, 1)
-        bbox = (1 - alpha) * bbox_start + alpha * bbox_end
-        cx, cy, bw, bh = bbox
-        
-        top = max(0, int((cy - bh / 2) * H))
-        left = max(0, int((cx - bw / 2) * W))
-        bottom = min(H, top + int(bh * H))
-        right = min(W, left + int(bw * W))
-        
-        crop_h, crop_w = bottom - top, right - left
-        if crop_h < 2 or crop_w < 2:
-            return None
-        
-        rgb_crop = rgb[:, top:bottom, left:right]
-        depth_crop = depth[:, top:bottom, left:right]
-        bbox_t = torch.tensor(bbox, dtype=torch.float32)
-        
-        # Resize full image
-        img = F.interpolate(rgb.unsqueeze(0), size=(img_size, img_size),
-                            mode="bilinear", align_corners=False).squeeze(0)
-        
-        # Resize crop to square
-        sq = max(crop_h, crop_w)
-        obj_img = F.interpolate(rgb_crop.unsqueeze(0), size=(sq, sq),
-                                mode="bilinear", align_corners=False).squeeze(0)
-        
-        # Global log-depth normalization
-        gt_f = depth_crop.float()
-        valid_mask = gt_f > 0
-        if valid_mask.any():
-            gt_norm = (torch.log(gt_f + 1) / log_depth_scale).clamp(0, 1).squeeze(0)
-        else:
-            gt_norm = gt_f.squeeze(0)
-        
-        result = {
-            "img": img,
-            "bbox_t": bbox_t,
-            "obj_img": obj_img,
-            "gt_norm": gt_norm,
-            "crop_h": crop_h,
-            "crop_w": crop_w,
-        }
-        if keep_cpu:
-            result["frame_cpu"] = {
-                "rgb": rgb,
-                "depth": depth,
-                "rgb_crop": rgb_crop,
-                "depth_crop": depth_crop,
-                "bbox": bbox_t,
-                "crop_dim": (crop_h, crop_w),
-            }
-        return result
-        
-    except Exception as e:
-        print(f"  [worker] Exception loading {frame_path}: {type(e).__name__}: {e}")
-        return None
-
-
-def _load_frame_cpu(dataset, scene_meta, t, img_size, keep_cpu=False):
-    """Fallback synchronous loader using Dataset (main process only)."""
-    if t >= scene_meta["T"]:
-        return None
-    try:
-        frame = dataset.load_frame(scene_meta, t)
-    except Exception as e:
-        print(f"\n  [sync] Error loading frame {t}: {e}")
-        return None
-
-    crop_h, crop_w = frame["crop_dim"]
-    if crop_h < 2 or crop_w < 2:
-        return None
-
-    img = F.interpolate(frame["rgb"].unsqueeze(0), size=(img_size, img_size),
-                        mode="bilinear", align_corners=False).squeeze(0)
-    bbox_t = frame["bbox"]
-    sq = max(crop_h, crop_w)
-    obj_img = F.interpolate(frame["rgb_crop"].unsqueeze(0), size=(sq, sq),
-                            mode="bilinear", align_corners=False).squeeze(0)
-    gt_depth = frame["depth_crop"]
-
-    gt_f = gt_depth.float()
-    valid_mask = gt_f > 0
-    if valid_mask.any():
-        gt_norm = (torch.log(gt_f + 1) / LOG_DEPTH_SCALE).clamp(0, 1).squeeze(0)
-    else:
-        gt_norm = gt_f.squeeze(0)
-
-    return {
-        "img": img,
-        "bbox_t": bbox_t,
-        "obj_img": obj_img,
-        "gt_norm": gt_norm,
-        "crop_h": crop_h,
-        "crop_w": crop_w,
-        "frame_cpu": frame if keep_cpu else None,
-    }
-
-def _save_scene_state(model):
-    """Snapshot the per-scene LSTM hidden states (with grad graph intact)."""
-    return {
-        'ctx':   model.ctx_head.hx,
-        'shape': model.shape_head.hx,
-        'obj':   model.obj_head.hx,
-    }
-
-def _load_scene_state(model, state):
-    """Restore a previously saved LSTM state (or reset if None)."""
-    if state is None:
-        model.reset_lstm()
-    else:
-        model.ctx_head.hx   = state['ctx']
-        model.shape_head.hx = state['shape']
-        model.obj_head.hx   = state['obj']
-
-def _detach_scene_state(state):
-    """Detach all tensors in a saved scene state (for TBTT boundaries)."""
-    if state is None:
-        return None
-    return {k: tuple(h.detach() for h in v) for k, v in state.items()}
+def _move_scene_to_gpu(frames, device):
+    """Bulk-transfer all frame tensors to GPU and free CPU copies."""
+    for frame in frames:
+        for key in ("img", "bbox", "obj_img", "gt_norm"):
+            if key in frame:
+                frame[key] = frame[key].to(device, non_blocking=True)
+    torch.cuda.synchronize()
+    return frames
 
 def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
-    """
-    Batched TBTT epoch: processes up to BATCH_SCENES scenes concurrently.
-    Each scene keeps its own LSTM state and dynamic crop sizes.
-    I/O is parallelised via a ThreadPoolExecutor prefetch queue.
-    Returns (avg_loss, metrics_dict | None, snapshots | None).
-    """
+    """TBTT epoch: one scene at a time, frames pre-loaded by DataLoader workers."""
     mode = "Train" if is_train else "Val"
     model.train() if is_train else model.eval()
 
     total_frames = 0
-    dataset = loader.dataset
-    n_scenes = len(dataset)
 
     # Validation metric accumulators
     sum_mae = 0.0
@@ -516,204 +348,105 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
     if not is_train:
         loader.dataset.rng = np.random.default_rng(123)
 
-    batch_idx = 0
-    for scene_batch in loader:
-        B = len(scene_batch)
-        Ts = [sm["T"] for sm in scene_batch]
-        max_T = max(Ts)
+    for scene_idx, scene_data in enumerate(loader):
+        scene_name = scene_data["scene"]
+        T = scene_data["T"]
+        frames = scene_data["frames"]
 
-        if max_T < 2:
-            batch_idx += 1
+        if T < 2:
             continue
 
+        model.reset_lstm()
         chunk_loss = torch.tensor(0.0, device=device)
         chunk_steps = 0
-        batch_t0 = time.time()
-        need_cpu = not is_train
+        scene_t0 = time.time()
+        scene_frames = []  # for val snapshot video
 
-        # Per-scene LSTM states (None = fresh init)
-        scene_states = [None] * B
+        # Bulk-transfer entire scene to GPU, free CPU copies
+        frames = _move_scene_to_gpu(frames, device)
 
-        # Per-scene video frame collectors (val only)
-        batch_scene_frames = [[] for _ in range(B)]
+        for t, frame in enumerate(frames):
+            img     = frame["img"].unsqueeze(0)
+            bbox_t  = frame["bbox"].unsqueeze(0)
+            obj_img = frame["obj_img"].unsqueeze(0)
+            gt_norm = frame["gt_norm"]
+            crop_h  = frame["crop_h"]
+            crop_w  = frame["crop_w"]
 
-        # Minimal prefetch: 2 workers, depth 2 - safe from segfaults
-        pool = _init_prefetch_pool()
-        futures = {}
-        crash_fallback = False  # If True, skip prefetch and load sync
-        
-        for t_pf in range(min(PREFETCH_DEPTH, max_T)):
-            for b in range(B):
-                if t_pf < Ts[b]:
-                    meta = scene_batch[b]
-                    futures[(b, t_pf)] = pool.submit(
-                        _load_frame_standalone,
-                        meta["frame_paths"][t_pf],
-                        meta["bbox_start"],
-                        meta["bbox_end"],
-                        t_pf, meta["T"],
-                        None,  # pkgd_tf_idx (transforms not used in prefetch)
-                        IMG_SIZE, need_cpu, LOG_DEPTH_SCALE
-                    )
+            valid_frac = (gt_norm > 0).float().mean().item()
+            needs_loss = valid_frac >= MIN_VALID_FRAC
 
-        for t in range(max_T):
-            # Gather prefetched frames for this timestep
-            frames = []
-            for b in range(B):
-                key = (b, t)
-                if crash_fallback:
-                    # Load synchronously after a crash
-                    if t < Ts[b]:
-                        frames.append(_load_frame_cpu(dataset, scene_batch[b], t, IMG_SIZE, need_cpu))
-                    else:
-                        frames.append(None)
-                elif key in futures:
-                    try:
-                        frames.append(futures.pop(key).result(timeout=PREFETCH_TIMEOUT))
-                    except FuturesTimeoutError:
-                        print(f"\n  [prefetch] TIMEOUT waiting for frame {t} scene {b} - worker may have crashed")
-                        frames.append(_load_frame_cpu(dataset, scene_batch[b], t, IMG_SIZE, need_cpu))
-                    except Exception as e:
-                        print(f"\n  [prefetch] Worker CRASHED: {type(e).__name__}: {e}")
-                        print(f"    Falling back to synchronous loading for rest of batch")
-                        crash_fallback = True
-                        # Cancel remaining futures
-                        for fut in futures.values():
-                            fut.cancel()
-                        futures.clear()
-                        # Reinitialize pool for next batch
-                        global _prefetch_pool
-                        try:
-                            _prefetch_pool.shutdown(wait=False)
-                        except:
-                            pass
-                        _prefetch_pool = None
-                        # Load this frame synchronously
-                        if t < Ts[b]:
-                            frames.append(_load_frame_cpu(dataset, scene_batch[b], t, IMG_SIZE, need_cpu))
-                        else:
-                            frames.append(None)
-                else:
-                    frames.append(None)
-
-            # Submit prefetch for next timestep (if not in crash fallback mode)
-            if not crash_fallback:
-                pf_t = t + PREFETCH_DEPTH
-                if pf_t < max_T:
-                    for b in range(B):
-                        if pf_t < Ts[b]:
-                            meta = scene_batch[b]
-                            futures[(b, pf_t)] = pool.submit(
-                                _load_frame_standalone,
-                                meta["frame_paths"][pf_t],
-                                meta["bbox_start"],
-                                meta["bbox_end"],
-                                pf_t, meta["T"],
-                                None,
-                                IMG_SIZE, need_cpu, LOG_DEPTH_SCALE
-                            )
-
-            # Process each scene individually (variable crop sizes)
-            n_alive = 0
-            for b in range(B):
-                if frames[b] is None:
-                    continue
-                n_alive += 1
-
-                # Move to GPU
-                img     = frames[b]["img"].unsqueeze(0).to(device, non_blocking=True)
-                bbox_t  = frames[b]["bbox_t"].unsqueeze(0).to(device, non_blocking=True)
-                obj_img = frames[b]["obj_img"].unsqueeze(0).to(device, non_blocking=True)
-                gt_norm = frames[b]["gt_norm"].to(device, non_blocking=True)
-                crop_h  = frames[b]["crop_h"]
-                crop_w  = frames[b]["crop_w"]
-                frame   = frames[b].get("frame_cpu")
-
-                # Load this scene's LSTM state
-                _load_scene_state(model, scene_states[b])
-
-                valid_frac = (gt_norm > 0).float().mean().item()
-                needs_loss = valid_frac >= MIN_VALID_FRAC
-
-                if is_train:
-                    if needs_loss:
-                        with autocast("cuda"):
-                            pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
-                            pred = pred.squeeze(0)
-                            log_unc = log_unc.squeeze(0)
-                        depth_loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
-                        loss = depth_loss
-                        chunk_loss = chunk_loss + loss
-
-                        with torch.no_grad():
-                            report_depth_loss_acc = report_depth_loss_acc + depth_loss.detach()
-                            vm = gt_norm > 0
-                            if vm.any():
-                                report_loss_acc = report_loss_acc + (pred[vm].float() - gt_norm[vm].float()).abs().mean()
-                                report_count += 1
-                    else:
-                        with torch.no_grad(), autocast("cuda"):
-                            _ = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
-                else:
-                    with torch.no_grad(), autocast("cuda"):
+            if is_train:
+                if needs_loss:
+                    with autocast("cuda"):
                         pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
                         pred = pred.squeeze(0)
                         log_unc = log_unc.squeeze(0)
+                    depth_loss = uncertainty_aware_loss(pred.float(), log_unc.float(), gt_norm.float()) * valid_frac
+                    chunk_loss = chunk_loss + depth_loss
 
-                    if needs_loss:
-                        frame_loss = masked_combined_loss(pred.float(), gt_norm.float())
-                        chunk_loss = chunk_loss + frame_loss
-                        report_loss_acc = report_loss_acc + frame_loss.detach()
-                        report_count += 1
+                    with torch.no_grad():
+                        report_depth_loss_acc = report_depth_loss_acc + depth_loss.detach()
+                        vm = gt_norm > 0
+                        if vm.any():
+                            report_loss_acc = report_loss_acc + (pred[vm].float() - gt_norm[vm].float()).abs().mean()
+                            report_count += 1
+                else:
+                    with torch.no_grad(), autocast("cuda"):
+                        _ = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+            else:
+                with torch.no_grad(), autocast("cuda"):
+                    pred, log_unc = model(img, bbox_t, crop_h, crop_w, obj_img=obj_img)
+                    pred = pred.squeeze(0)
+                    log_unc = log_unc.squeeze(0)
 
-                        valid = gt_norm > 0
-                        if valid.any():
-                            p = pred[valid].float()
-                            g = gt_norm[valid].float()
-                            n_px = p.numel()
-                            sum_mae += (p - g).abs().sum().item()
-                            sum_sq_err += ((p - g) ** 2).sum().item()
-                            ratio = torch.max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
-                            sum_delta1 += (ratio < 1.05).sum().item()
-                            total_val_pixels += n_px
+                if needs_loss:
+                    frame_loss = masked_combined_loss(pred.float(), gt_norm.float())
+                    chunk_loss = chunk_loss + frame_loss
+                    report_loss_acc = report_loss_acc + frame_loss.detach()
+                    report_count += 1
 
-                        if t % SNAP_STRIDE == 0 and frame is not None:
-                            gt_np = gt_norm.float().cpu().numpy()
-                            pred_np = pred.float().cpu().numpy()
-                            snap_valid = gt_np > 0
-                            snap_valid_pct = float(snap_valid.mean()) * 100.0
-                            if snap_valid.any():
-                                sp, sg = pred_np[snap_valid], gt_np[snap_valid]
-                                snap_mae = float(np.abs(sp - sg).mean())
-                                snap_rmse = float(np.sqrt(((sp - sg) ** 2).mean()))
-                                snap_ratio = np.maximum(sp / np.clip(sg, 1e-6, None),
-                                                        sg / np.clip(sp, 1e-6, None))
-                                snap_d1 = float((snap_ratio < 1.05).mean())
-                            else:
-                                snap_mae = snap_rmse = snap_d1 = 0.0
-                            batch_scene_frames[b].append({
-                                "scene": scene_batch[b]["scene"],
-                                "frame_idx": t,
-                                "T": Ts[b],
-                                "rgb_full": frame["rgb"].permute(1, 2, 0).numpy(),
-                                "rgb_crop": frame["rgb_crop"].permute(1, 2, 0).numpy(),
-                                "pred": pred_np,
-                                "gt": gt_np,
-                                "uncertainty": np.exp(log_unc.float().cpu().numpy()),
-                                "mae": snap_mae,
-                                "rmse": snap_rmse,
-                                "delta1": snap_d1,
-                                "valid_pct": snap_valid_pct,
-                            })
+                    valid = gt_norm > 0
+                    if valid.any():
+                        p = pred[valid].float()
+                        g = gt_norm[valid].float()
+                        n_px = p.numel()
+                        sum_mae += (p - g).abs().sum().item()
+                        sum_sq_err += ((p - g) ** 2).sum().item()
+                        ratio = torch.max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
+                        sum_delta1 += (ratio < 1.05).sum().item()
+                        total_val_pixels += n_px
 
-                # Save this scene's LSTM state
-                scene_states[b] = _save_scene_state(model)
+                    if t % SNAP_STRIDE == 0 and "rgb" in frame:
+                        gt_np = gt_norm.float().cpu().numpy()
+                        pred_np = pred.float().cpu().numpy()
+                        snap_valid = gt_np > 0
+                        snap_valid_pct = float(snap_valid.mean()) * 100.0
+                        if snap_valid.any():
+                            sp, sg = pred_np[snap_valid], gt_np[snap_valid]
+                            snap_mae = float(np.abs(sp - sg).mean())
+                            snap_rmse = float(np.sqrt(((sp - sg) ** 2).mean()))
+                            snap_ratio = np.maximum(sp / np.clip(sg, 1e-6, None),
+                                                    sg / np.clip(sp, 1e-6, None))
+                            snap_d1 = float((snap_ratio < 1.05).mean())
+                        else:
+                            snap_mae = snap_rmse = snap_d1 = 0.0
+                        scene_frames.append({
+                            "scene": scene_name,
+                            "frame_idx": frame["frame_idx"],
+                            "T": T,
+                            "rgb_full": frame["rgb"].permute(1, 2, 0).numpy(),
+                            "rgb_crop": frame["rgb_crop"].permute(1, 2, 0).numpy(),
+                            "pred": pred_np,
+                            "gt": gt_np,
+                            "uncertainty": np.exp(log_unc.float().cpu().numpy()),
+                            "mae": snap_mae,
+                            "rmse": snap_rmse,
+                            "delta1": snap_d1,
+                            "valid_pct": snap_valid_pct,
+                        })
 
-            if n_alive == 0:
-                continue
-
-            del frames
-            total_frames += n_alive
+            total_frames += 1
             chunk_steps += 1
 
             # --- TBTT boundary ---
@@ -729,14 +462,14 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
                 chunk_loss = torch.tensor(0.0, device=device)
                 chunk_steps = 0
 
-                # Detach all saved scene states
-                for b in range(B):
-                    scene_states[b] = _detach_scene_state(scene_states[b])
+                safe_detach_head(model.ctx_head)
+                safe_detach_head(model.shape_head)
+                safe_detach_head(model.obj_head)
 
             # Periodic frame progress
             if (t + 1) % PRINT_EVERY == 0:
                 running = report_loss_acc.item() / max(report_count, 1)
-                print(f"    [{((t+1) / max_T) * 100:.1f}%] Frame {t+1}/{max_T} (batch {batch_idx+1})  avg_mae={running:.5f}", end='\r')
+                print(f"    [{((t+1) / T) * 100:.1f}%] Frame {t+1}/{T} ({scene_name})  avg_mae={running:.5f}", end='\r')
 
         # Flush remaining chunk
         if is_train and chunk_steps > 0 and chunk_loss.requires_grad:
@@ -748,31 +481,27 @@ def run_epoch(loader, model, optimizer, scaler, device, is_train=True, epoch=0):
             scaler.step(optimizer)
             scaler.update()
 
-        del chunk_loss, scene_states
+        del chunk_loss
         torch.cuda.empty_cache()
 
-        batch_dt = time.time() - batch_t0
+        scene_dt = time.time() - scene_t0
 
-        # Save scene videos (val only)
-        for b in range(B):
-            if batch_scene_frames[b] and not is_train:
-                epoch_dir = os.path.join(SNAP_DIR, f"epoch_{epoch:03d}")
-                os.makedirs(epoch_dir, exist_ok=True)
-                _save_scene_video(batch_scene_frames[b], epoch, epoch_dir)
-                snapshots.append(scene_batch[b]["scene"])
-        del batch_scene_frames
+        # Save scene video (val only)
+        if scene_frames and not is_train:
+            epoch_dir = os.path.join(SNAP_DIR, f"epoch_{epoch:03d}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            _save_scene_video(scene_frames, epoch, epoch_dir)
+            snapshots.append(scene_name)
+        del scene_frames, frames
 
         gc.collect()
         _malloc_trim()
 
         report_loss_sum = report_loss_acc.item()
-        batch_avg = report_loss_sum / max(report_count, 1)
-        scene_names = ", ".join(sm["scene"] for sm in scene_batch)
-        print(f"  [{mode}] Batch {batch_idx+1} ({scene_names}) "
-              f"| {sum(Ts)} frames in {batch_dt:.1f}s "
-              f"| avg_mae={batch_avg:.5f}")
-
-        batch_idx += 1
+        scene_avg = report_loss_sum / max(report_count, 1)
+        print(f"  [{mode}] Scene {scene_idx+1} ({scene_name}) "
+              f"| {T} frames in {scene_dt:.1f}s "
+              f"| avg_mae={scene_avg:.5f}")
 
     epoch_dt = time.time() - epoch_t0
     report_loss_sum = report_loss_acc.item()
