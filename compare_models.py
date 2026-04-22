@@ -49,14 +49,19 @@ from model import DistanceNN  # noqa: E402
 # Utilities
 # ----------------------------------------------------------------------
 def _val_scene_names(val_split: float = 0.20) -> list[str]:
-    """Reproduce the train.py / baseline_train.py val-split."""
+    """Reproduce the train.py / baseline_train.py val-split.
+
+    Uses the legacy ``np.random.seed(42) + np.random.shuffle`` sequence so the
+    held-out scenes are identical to the ones seen by ``train.py`` during
+    validation.
+    """
     all_files = sorted(glob(os.path.join(DATA_DIR, "*/*-color.png")))
     scenes = defaultdict(list)
     for f in all_files:
         scenes[os.path.basename(os.path.dirname(f))].append(f)
     all_scenes = sorted(scenes.keys())
-    rng = np.random.default_rng(42)
-    rng.shuffle(all_scenes)
+    np.random.seed(42)
+    np.random.shuffle(all_scenes)
     n_val = max(1, int(len(all_scenes) * val_split))
     return all_scenes[:n_val]
 
@@ -111,13 +116,16 @@ class MetricAccumulator:
         self.px = 0
 
     def update(self, pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor) -> None:
+        # Matches train.py L409-416 and baseline_train.py L614-617 exactly:
+        #   - raw (p - g) for MSE, no clamp
+        #   - ratio = max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
         mask = valid > 0.5
         if not mask.any():
             return
-        p = pred[mask].float().clamp(min=1e-6)
-        g = gt[mask].float().clamp(min=1e-6)
+        p = pred[mask].float()
+        g = gt[mask].float()
         self.sq_sum += float(((p - g) ** 2).sum().item())
-        ratio = torch.max(p / g, g / p)
+        ratio = torch.max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
         self.d1 += int((ratio < self.DELTA_THRESH).sum().item())
         self.px += int(mask.sum().item())
 
@@ -186,7 +194,7 @@ def eval_lstm(model: DistanceNN, val_scenes: list[str], img_size: int,
 
             with autocast("cuda", dtype=torch.float16):
                 pred, _ = model(rgb_full, bbox_t, int(crop_h), int(crop_w), obj_img=obj)
-            pred = pred.squeeze(0)           # (1, ch, cw)
+            # model returns (1, ch, cw); gt_norm is (1, ch, cw) — keep aligned.
             acc.update(pred, gt_norm, valid)
 
     return acc.summary()
@@ -224,8 +232,8 @@ def parse_args():
     p.add_argument("--adabins", default="best_model_adabins.pt", help="AdaBins checkpoint")
     p.add_argument("--lstm-img-size", type=int, default=480,
                    help="Image size used when training the LSTM model")
-    p.add_argument("--bts-img-size", type=int, default=416)
-    p.add_argument("--adabins-img-size", type=int, default=416)
+    p.add_argument("--bts-img-size", type=int, default=480)
+    p.add_argument("--adabins-img-size", type=int, default=480)
     p.add_argument("--val-split", type=float, default=0.20)
     p.add_argument("--skip-latency", action="store_true")
     p.add_argument("--skip-eval", action="store_true",

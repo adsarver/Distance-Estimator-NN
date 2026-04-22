@@ -715,8 +715,9 @@ def main():
     for f in all_files:
         scenes_map[os.path.basename(os.path.dirname(f))].append(f)
     all_scenes = sorted(scenes_map.keys())
-    rng = np.random.default_rng(42)
-    rng.shuffle(all_scenes)
+    # Match train.py's legacy RNG so val/train scene splits are identical.
+    np.random.seed(42)
+    np.random.shuffle(all_scenes)
     n_val = max(1, int(len(all_scenes) * args.val_split))
     val_scenes = all_scenes[:n_val]
     train_scenes = all_scenes[n_val:]
