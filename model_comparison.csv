@@ -1,0 +1,2 @@
+model,params,delta1,mse,latency_ms,fps,ckpt
+LSTM (DistanceNN),6972122,nan,nan,2.1509,464.9209,best_model.pt
