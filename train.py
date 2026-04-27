@@ -123,7 +123,7 @@ model = DistanceNN(
 ).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-warmup_epochs = 5
+warmup_epochs = 0
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - warmup_epochs)
 scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
@@ -167,21 +167,21 @@ if RESUME_FROM and os.path.isfile(RESUME_FROM):
     # Handle both plain state_dict and full checkpoint dict
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         partial_load_state_dict(model, ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except (ValueError, KeyError):
-                print("  Optimizer state incompatible, starting fresh optimizer")
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if "epoch" in ckpt:
-            start_epoch = ckpt["epoch"] + 1
-        if "history" in ckpt:
-            history = ckpt["history"]
-        if "best_val_loss" in ckpt:
-            best_val_loss = ckpt["best_val_loss"]
+        # if "optimizer_state_dict" in ckpt:
+        #     try:
+        #         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        #     except (ValueError, KeyError):
+        #         print("  Optimizer state incompatible, starting fresh optimizer")
+        # if "scheduler_state_dict" in ckpt:
+        #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        # if "scaler_state_dict" in ckpt:
+        #     scaler.load_state_dict(ckpt["scaler_state_dict"])
+        # if "epoch" in ckpt:
+        #     start_epoch = ckpt["epoch"] + 1
+        # if "history" in ckpt:
+        #     history = ckpt["history"]
+        # if "best_val_loss" in ckpt:
+        #     best_val_loss = ckpt["best_val_loss"]
         print(f"Resumed full checkpoint from {RESUME_FROM} (epoch {start_epoch - 1})")
     else:
         # Plain state_dict (e.g. old best_model.pt)
