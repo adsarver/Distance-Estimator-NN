@@ -1,0 +1,4 @@
+model,params,delta1_05,delta1_25,mse,latency_ms,fps,ckpt
+LSTM (DistanceNN),6972122,0.090417,0.371709,2.169795e-02,0.6537,1529.7496,last_model.pt
+BTS,55488106,0.267660,0.750372,1.044937e-02,6.8975,144.9801,best_model_bts.pt
+AdaBins,33478833,0.233127,0.751430,1.049638e-02,4.9573,201.7208,best_model_adabins.pt

@@ -216,8 +216,8 @@ class _LocalPlanarGuidance(nn.Module):
         self.upratio = upratio
         u = (torch.arange(upratio).float() + 0.5) / upratio - 0.5
         uu, vv = torch.meshgrid(u, u, indexing="ij")
-        self.register_buffer("u", uu.reshape(1, 1, upratio, upratio))
-        self.register_buffer("v", vv.reshape(1, 1, upratio, upratio))
+        self.register_buffer("u", uu.reshape(1, 1, upratio, upratio).clone())
+        self.register_buffer("v", vv.reshape(1, 1, upratio, upratio).clone())
 
     def forward(self, plane: torch.Tensor) -> torch.Tensor:
         theta = torch.sigmoid(plane[:, 0:1]) * math.pi / 3
