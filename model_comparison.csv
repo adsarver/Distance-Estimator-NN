@@ -1,4 +1,4 @@
-model,params,delta1,mse,latency_ms,fps,ckpt
-LSTM (DistanceNN),6972122,0.238532,4.811121e-02,0.6496,1539.4331,best_model.pt
-BTS,55488106,0.750372,1.044937e-02,6.7039,149.1665,best_model_bts.pt
-AdaBins,33478833,0.751430,1.049637e-02,4.7866,208.9163,best_model_adabins.pt
+model,params,delta1_05,delta1_25,mse,latency_ms,fps,ckpt
+LSTM (DistanceNN),6972122,0.124636,0.453535,1.903377e-02,0.6280,1592.2415,last_model.pt
+BTS,55488106,0.267660,0.750372,1.044937e-02,6.8760,145.4335,best_model_bts.pt
+AdaBins,33478833,0.233126,0.751429,1.049642e-02,4.9585,201.6755,best_model_adabins.pt

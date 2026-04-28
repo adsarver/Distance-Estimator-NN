@@ -224,7 +224,7 @@ def _lstm_sampler(img_size: int, device, model: DistanceNN):
 # ----------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--lstm", default="best_model.pt", help="LSTM checkpoint (train.py)")
+    p.add_argument("--lstm", default="last_model.pt", help="LSTM checkpoint (train.py)")
     p.add_argument("--bts", default="best_model_bts.pt", help="BTS checkpoint")
     p.add_argument("--adabins", default="best_model_adabins.pt", help="AdaBins checkpoint")
     p.add_argument("--lstm-img-size", type=int, default=480,
